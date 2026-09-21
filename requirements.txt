@@ -1,0 +1,8 @@
+ultralytics>=8.3
+lap
+fastapi
+uvicorn[standard]
+opencv-python
+numpy
+# tests only
+httpx

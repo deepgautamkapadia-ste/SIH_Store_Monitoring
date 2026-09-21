@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+# runtime state — never commit
+*.db
+*.db-journal
+shelf_ref_*.png
+*.pt
+# test outputs
+tests/*.mp4
+tests/*.jpg
+tests/*.png
+tests/*.db
