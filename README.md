@@ -13,7 +13,7 @@ The dashboard has six tabs:
 | Tab | What you do there |
 |---|---|
 | **Home** | Live KPIs (inside now, entries, sales today, conversion, queue wait), alerts that say what to do, products running low, floor heatmap, footfall by hour |
-| **Shelves** | Draw a box around each product on the shelf picture, attach the product (SKU, barcode, brand, MRP, price), say how many sit side by side and how deep they stack. Live per-product stock table. Product catalog with printable barcode labels |
+| **Shelves** | Draw a box around each product on the shelf picture, attach the product (SKU, barcode, brand, MRP, price), say how many sit side by side, how deep they stack and how big one unit is (that turns on depth counting). Live per-product stock table and a depth view. Product catalog with printable barcode labels |
 | **Checkout** | Self-checkout / billing counter: scan with a USB barcode scanner, a checkout camera, or type a SKU or name. Cart with quantities, savings vs MRP, and a bill as PNG and PDF — "please move to the payment counter" |
 | **CCTV** | Every camera as a plain security view with people boxes and counts (faces blurred here too), or with analytics overlays |
 | **Analytics** | Footfall and bills per day, conversion, a weekday × hour busyness heatmap, footfall and revenue by hour, top products, stock-outs, basket sizes, queue waits — plus CSV exports for forecasting models |
@@ -22,7 +22,8 @@ The dashboard has six tabs:
 ## Why it's different
 
 - **Products, not grid cells.** You mark each product block on the shelf picture — a box can be as narrow as a single item, so taking one out registers. Each box is split into its facings (units side by side), and each knows its row and column on the shelf, so an alert reads *"Maggi Masala Noodles 70g — Aisle A, row 1 · col 1 low — about 12 of 24 left."*
-- **Honest stock counts.** One ordinary camera sees the front row of a shelf, not what's behind it. So the camera count is an **estimate** — facings still visible × how deep the storekeeper says they stack — and it's labelled as one. Where the till is used, stock is also tracked exactly: calibrating sets the level, each sale decrements it. Both numbers are shown side by side.
+- **Counts units behind the front row — with one ordinary camera, at any angle.** When the front unit of a column is taken, the next one is still there, just further back. A monocular depth model (Depth Anything V2, metric indoor) estimates distance for every pixel; StoreSense turns that into 3-D points, finds the plane of the product fronts on the full shelf, and gives every column a "tube" going back from it. The nearest solid surface in the tube, divided by the size of one unit, is how many are gone. See [How depth counting works](#how-depth-counting-works).
+- **Honest about what it can't see.** From some angles a deep gap is hidden by the units beside it. Those columns are marked hidden (the front unit is known to be gone; the rest isn't guessed). Products without a unit size fall back to an estimate — facings still visible × how deep they stack — labelled as one. Where the till is used, stock is also tracked exactly: calibrating sets the level, each sale decrements it. Both numbers are shown side by side.
 - **Model your store, don't match a template.** Shelves and cameras go anywhere on the plan. Which shelf face a camera watches is computed from its position, lens angle, range and line of sight, so blind spots show up before you mount anything.
 - **Occlusion-aware.** When a shopper stands in front of a product, that box keeps its last reading instead of raising a false "empty".
 - **Checkout that works with what a shop has.** A basic USB barcode scanner, a phone pointed at the counter, or typing. Products without a barcode get an in-store EAN-13 from the GS1 20–29 range reserved for exactly this, with a printable label.
@@ -62,17 +63,37 @@ python storesense.py \
   --cam till   checkout     http://192.168.1.25:8080/video
 ```
 
-or add them in **Setup** with their `source` and just run `python storesense.py`. A source can be a webcam index, an HTTP/RTSP stream or a video file. Camera roles: `entry`, `queue` (these two can share a camera), `shelf`, `checkout`.
+or add them in **Setup**: select the camera, type its source, **Save plan** — it connects straight away, and the panel shows **● live** or, in plain words, why it isn't. A source can be a webcam index, a phone's address, an HTTP/RTSP stream or a video file. For a phone you can type just `192.168.1.24:8080` — `http://` and `/video` are added for you. Camera jobs: count people and watch queue (can share a camera), watch shelves, self-checkout.
+
+If a phone won't connect: open its address in the laptop's browser first. If that doesn't load either, the network is the problem — campus and office Wi-Fi usually block devices from reaching each other, so put the phones and laptop on a phone hotspot instead.
 
 ## Setting up a store
 
-1. **Plan** (Setup tab): set the store size, drag in shelves and cameras, tick which shelf faces to monitor, give each camera its source, **Save plan**. Restart to start new cameras.
+1. **Plan** (Setup tab): set the store size, drag in shelves and cameras, tick which shelf faces to monitor, give each camera its source, **Save plan**. Cameras start, restart or stop as soon as the plan is saved.
 2. **Point the cameras** (Setup tab, select a camera): click on its picture to place the **entry line** (flip the in/out direction with one button), the **queue area**, and four **floor points** that tie it into the store heatmap.
 3. **Calibrate shelves** (Shelves tab): fill the shelf, clear the aisle, press **Calibrate**.
-4. **Mark products** (Shelves tab): **Draw product box** around each product block, choose the product or create it, set facings and depth, **Save products**. Editing boxes later needs no re-calibration.
+4. **Mark products** (Shelves tab): **Draw product box** around each product block, choose the product or create it, set facings, how many deep, and the size of one unit front to back (cm) — the last one turns on depth counting for that product. **Save products**. Editing boxes later needs no re-calibration. After calibrating, leave the shelf untouched for ~20 s while the depth reference is measured.
 5. **Products and labels** (Shelves tab, catalog): add products, print barcode labels for anything without one.
 
 All settings live in `CONFIG` at the top of `storesense.py`; a JSON file passed with `--config` is merged over it.
+
+## How depth counting works
+
+1. **Calibrate** with the shelf full. The depth model runs on the full-shelf picture a few times; the median is the reference.
+2. The reference is turned into 3-D points (using the camera's field of view from the store plan). A plane is fitted through the product fronts, and each column's front face becomes a small patch on it — the mouth of that column's tube.
+3. **Every few seconds** a new depth pass is aligned to the reference on the parts that shouldn't change (shelf frame, walls, floor). A monocular model's scale drifts a few percent between frames — at 1.5 m that's a whole unit — so this re-anchoring is what makes centimetre differences usable.
+4. For each column, the nearest dense surface inside its tube is found (the rim of a gap is smeared by the model, so isolated near points are ignored). Distance behind the full front ÷ unit size = units gone. Median of the last few passes.
+5. If nothing solid is visible in a tube — the neighbours hide it from this angle — the column is reported **hidden**: the front unit is known gone, the rest isn't guessed. Someone standing in front: the last reading holds.
+
+Check the model on your own shelf before trusting it: take two photos from the same spot, full and with a few front units removed, and run
+
+```bash
+python storesense.py --depth-test full.jpg taken.jpg
+```
+
+It prints the fit error and how far back the changed area moved, and writes `depth_test.png`. On Qualcomm hardware the same model family is available from [Qualcomm AI Hub](https://aihub.qualcomm.com/models/depth_anything_v2) for the Hexagon NPU.
+
+**Tested:** on a ray-traced shelf with known true depth, with the model replaced by true depth plus scale/offset drift, blur, low-frequency error and noise (`tests/test_depth.py`): from straight on, 18° to the side and 14° from above, every column the camera could see was counted exactly; up to two columns per view were correctly reported hidden. **Not yet tested:** the real model on a real shelf — thin products (under ~3 cm deep) and shiny or transparent packs are the likely weak spots.
 
 ## Data for forecasting
 
@@ -113,6 +134,7 @@ One Python file. It runs on any laptop for development. The deployment target is
 python tests/test_logic.py    # counting, queue, shelf grid, alerts, API, offline sync
 python tests/test_layout.py   # store plan geometry, coverage, store-frame mapping, 3D render
 python tests/test_pos.py      # catalog, carts, bills, checkout camera, product boxes, stock counts
+python tests/test_depth.py    # depth counting on a ray-traced shelf from three camera angles
 python tests/test_real.py     # real YOLO on a generated walk-through video
 ```
 
@@ -122,7 +144,7 @@ python tests/test_real.py     # real YOLO on a generated walk-through video
 
 **Not yet validated in a real store:** product-box detection under real shelf lighting, the floor mapping on a real floor, queue forecasts against real queues, and barcode reading on real packaging at a real counter.
 
-**Limits to be upfront about:** the camera stock count is an estimate (it cannot see behind the front row); the till count is exact only for products sold through this checkout.
+**Limits to be upfront about:** depth counting depends on a monocular model and has not yet been validated on a real shelf; deep gaps can be hidden from a camera at an angle (reported, not guessed); if staff pull stock forward, the camera sees a full front row again — the till count catches that. The till count is exact only for products sold through this checkout.
 
 **Roadmap:** cross-checking a shelf face seen by two cameras; a trained SKU model for planogram checks (SKU-110K fine-tune); a multi-store HQ view; porting to Qualcomm hardware and benchmarking on RB3 Gen 2 / Snapdragon.
 
@@ -135,6 +157,7 @@ python tests/test_real.py     # real YOLO on a generated walk-through video
 | GET/POST | `/api/layout` | Store plan, with per-face coverage |
 | GET/POST | `/api/slots/{cam}` | Product boxes on a shelf camera |
 | GET | `/api/shelf/{cam}/still.jpg` | Calibrated shelf picture to mark products on |
+| GET | `/api/depth/{cam}.jpg` | Latest depth pass with each column's count |
 | POST | `/api/calibrate/{cam}` | Capture the shelf reference |
 | GET/POST/DELETE | `/api/products` · `/api/products/{sku}` | Product catalog |
 | GET | `/api/products/{sku}/label.png` | Printable EAN-13 label |

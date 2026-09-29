@@ -23,3 +23,5 @@ bills/
 analytics/
 tests/bills_test/
 tests/*.csv
+tests/depth_view_test.jpg
+depth_test.png

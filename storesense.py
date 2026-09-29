@@ -7,6 +7,8 @@ Modules (reference repo each one replaces)
   • Footfall: entry/exit counting, live occupancy, hourly trend     (DeepStream retail analytics + ByteTrack)
   • Floor grid: heatmap + zone dwell time via homography            (DeepStream zone analytics)
   • Shelf grid: per-cell OK / LOW / EMPTY / MISPLACED, occlusion-aware (Retail-Shelf-Monitoring, StoreEye)
+  • Depth count: units left behind the front row of each column, from one ordinary camera at
+    any angle — monocular depth (Depth Anything V2, metric indoor) in shelf coordinates
   • Depletion forecast: time-to-empty per shelf cell                (demand-forecasting repos)
   • Queue: length, time in queue, +5/+10/+15 min forecast,
     counters-to-open recommendation                                  (QueueLess + multistep forecasting)
@@ -17,7 +19,7 @@ Modules (reference repo each one replaces)
   • Privacy: only track IDs + numbers stored. No frames, no faces. Heads blurred on live feeds.
 
 Install
-  pip install ultralytics lap fastapi "uvicorn[standard]" opencv-python numpy
+  pip install ultralytics lap fastapi "uvicorn[standard]" opencv-python numpy transformers
   (plain "uvicorn" has no WebSocket support; the dashboard then falls back to polling)
 
 Run
@@ -80,6 +82,16 @@ CONFIG = {
         "eta_window_min": 20,
         "planogram": {},            # {"shelfA": {"0,0": "maggi", ...}} — used only with sku_model
         "weights": {},              # priority multiplier per shelf cam, e.g. {"shelfA": 1.5}
+        # Monocular depth: counts units BEHIND the front row from one ordinary camera at any angle.
+        # Used for product boxes that have "unit depth (cm)" set; others fall back to facings × depth.
+        "depth": {
+            "enabled": True,        # needs: pip install transformers  (weights download on first use)
+            "model": "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf",
+            "every_s": 6.0,         # one depth pass per shelf camera this often (~0.3-1 s on a laptop CPU)
+            "smooth": 3,            # median over this many passes per column
+            "hfov_deg": 65,         # camera's horizontal field of view if the store plan doesn't give one
+            "calib_passes": 3,      # depth passes averaged into the full-shelf reference after Calibrate
+        },
     },
     "queue": {
         "open_counters": 1, "max_counters": 4,
@@ -291,6 +303,8 @@ class Layout:
                     "sku": sl.get("sku", ""),
                     "x": float(sl["x"]), "y": float(sl["y"]), "w": float(sl["w"]), "h": float(sl["h"]),
                     "facings": max(1, int(sl.get("facings", 1))), "deep": max(1, int(sl.get("deep", 1))),
+                    # front-to-back size of one unit; enables the depth-model count for this box
+                    "unit_cm": max(0.0, float(sl.get("unit_cm") or 0)),
                 })
             if slots:
                 cam["slots"] = slots
@@ -340,17 +354,57 @@ class Layout:
 
 
 # ─────────────────────────────── CAPTURE ───────────────────────────────
+def normalise_source(src):
+    """Fix the usual phone-camera URL slips: '192.168.1.5:8080' → 'http://192.168.1.5:8080/video'.
+    IP Webcam and DroidCam both stream MJPEG at /video; the bare address is their web page."""
+    s = str(src).strip()
+    if s.isdigit() or not s:
+        return s
+    from urllib.parse import urlparse
+    if not s.startswith(("http://", "https://", "rtsp://")) and not os.path.exists(s) and \
+            (s[0].isdigit() and ("." in s or ":" in s)):
+        s = "http://" + s
+    u = urlparse(s)
+    if u.scheme in ("http", "https") and u.path in ("", "/"):
+        s = s.rstrip("/") + "/video"
+    return s
+
+
 class Capture:
-    """Threaded reader that always holds the latest frame. Reconnects streams, loops files."""
+    """Threaded reader that always holds the latest frame. Reconnects streams, loops files.
+    Keeps a plain-words status ('live', or why it isn't) for the dashboard."""
 
     def __init__(self, src):
+        src = normalise_source(src)
         self.src = int(src) if str(src).isdigit() else src
         self.is_file = isinstance(self.src, str) and not self.src.startswith(("http", "rtsp")) and os.path.exists(self.src)
         self.frame, self.lock = None, threading.Lock()
+        self.alive, self.status, self.fails = True, "connecting…", 0
         threading.Thread(target=self._run, daemon=True).start()
 
+    def stop(self):
+        self.alive = False
+
+    def why(self):
+        s = self.src
+        if isinstance(s, int):
+            return f"webcam {s} not available — another app using it, or wrong index"
+        if isinstance(s, str) and s.startswith("http"):
+            return (f"no picture from {s} — is the phone's camera server started, is it on the same Wi-Fi "
+                    f"(campus Wi-Fi often blocks phone-to-laptop; use a hotspot), and does the URL open in a browser?")
+        if isinstance(s, str) and s.startswith("rtsp"):
+            return f"no picture from {s} — check the address, username/password and that the camera is on"
+        return f"can't open {s} — file not found or unreadable"
+
     def _open(self):
-        cap = cv2.VideoCapture(self.src)
+        if isinstance(self.src, str) and self.src.startswith(("http", "rtsp")):
+            try:                                # don't hang ~30 s on an address that isn't there
+                cap = cv2.VideoCapture(self.src, cv2.CAP_FFMPEG,
+                                       [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000])
+            except (TypeError, cv2.error):      # older OpenCV without open parameters
+                cap = cv2.VideoCapture(self.src)
+        else:
+            cap = cv2.VideoCapture(self.src)
         if isinstance(self.src, int):
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -361,7 +415,7 @@ class Capture:
     def _run(self):
         cap = self._open()
         fps = cap.get(cv2.CAP_PROP_FPS) or 25
-        while True:
+        while self.alive:
             ok, f = cap.read()
             if not ok:
                 if self.is_file:
@@ -370,14 +424,20 @@ class Capture:
                 if not ok:
                     with self.lock:
                         self.frame = None
+                    self.fails += 1
+                    self.status = self.why() + (f" (retrying, attempt {self.fails})" if self.fails > 1 else "")
                     cap.release()
-                    time.sleep(1.0)
+                    time.sleep(min(1.0 + self.fails * 0.5, 5.0))
+                    if not self.alive:
+                        break
                     cap = self._open()
                     continue
+            self.fails, self.status = 0, "live"
             with self.lock:
                 self.frame = f
             if self.is_file:
                 time.sleep(1.0 / max(fps, 1))
+        cap.release()
 
     def read(self):
         with self.lock:
@@ -704,6 +764,7 @@ class Engine:
         self.queues, self.shelves, self.heat, self.aisle, self.cams = {}, {}, {}, {}, {}
         self.labels = {}              # camera -> human name from the layout ("Aisle 1 A, S face")
         self.cam_face = {}            # camera -> "shelfId:FACE", so the 3D view can colour it
+        self.depth_info = {}          # shelf camera -> depth model status
         self.stock, self.sold = {}, {}   # sku -> units at last restock / sold since then (POS)
         self.carts, self.active_cart, self.last_scan = {}, None, None
         self.zone_stats = defaultdict(lambda: defaultdict(lambda: [0, 0.0]))
@@ -950,9 +1011,10 @@ class Engine:
             else:
                 self.resolve(key + ":pg")
 
-    def cam_status(self, name, roles, online, fps, people=0):
+    def cam_status(self, name, roles, online, fps, people=0, msg=""):
         with self.lock:
-            self.cams[name] = {"roles": sorted(roles), "online": online, "fps": round(fps, 1), "people": people}
+            self.cams[name] = {"roles": sorted(roles), "online": online, "fps": round(fps, 1), "people": people,
+                               "msg": msg}
 
     def refresh_daily(self):
         since = day_start()
@@ -992,6 +1054,7 @@ class Engine:
                 "avg_time_in_queue_min": round(float(np.mean(self.served)) / 60, 2) if self.served else None,
                 "cams": dict(self.cams), "alerts": alerts[:50],
                 "labels": dict(self.labels), "cam_face": dict(self.cam_face),
+                "depth": dict(self.depth_info),
                 "pos_tracked": len(self.stock),
                 "pos": {"active_cart": self.active_cart, "last_scan": self.last_scan},
                 "sales_today": getattr(self, "sales_today", 0), "bills_today": getattr(self, "bills_today", 0),
@@ -1024,6 +1087,7 @@ class CamWorker(threading.Thread):
     def __init__(self, name, roles, source, engine):
         super().__init__(daemon=True)
         self.name, self.roles, self.engine = name, roles, engine
+        self.source, self.alive = source, True
         self.cap = Capture(source)
         self.jpg, self.fps = None, 0.0
         self.t_prev = self.t_start = time.time()
@@ -1052,11 +1116,15 @@ class CamWorker(threading.Thread):
         if ok:
             self.cctv_jpg = buf.tobytes()
 
+    def stop(self):
+        self.alive = False
+        self.cap.stop()
+
     def run(self):
-        while True:
+        while self.alive:
             f = self.cap.read()
             if f is None:
-                self.engine.cam_status(self.name, self.roles, False, 0)
+                self.engine.cam_status(self.name, self.roles, False, 0, msg=self.cap.status)
                 time.sleep(0.3)
                 continue
             t = time.time()
@@ -1070,7 +1138,8 @@ class CamWorker(threading.Thread):
             ok, buf = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 self.jpg = buf.tobytes()
-            self.engine.cam_status(self.name, self.roles, True, self.fps, self.people)
+            if self.alive:
+                self.engine.cam_status(self.name, self.roles, True, self.fps, self.people, msg="live")
             sl = self.period - (time.time() - t)
             if sl > 0:
                 time.sleep(sl)
@@ -1279,6 +1348,173 @@ class PeopleWorker(CamWorker):
         })
 
 
+# ─────────────────────────── MONOCULAR DEPTH ───────────────────────────
+# One ordinary camera sees only the front unit of each column. When that unit is taken, the next
+# one is still there — just further back. A monocular depth model (Depth Anything V2, metric indoor)
+# estimates distance per pixel, so "how far back is the front unit now, compared with the full
+# shelf" divided by the size of one unit = units gone from that column. Works at any camera angle.
+DEPTH = {"fn": None, "err": None, "tried": False, "lock": threading.Lock(), "name": None}
+
+
+def depth_model():
+    """The depth function (BGR frame -> metres per pixel, same size), or None with DEPTH['err'] set.
+    Loaded once, shared by every shelf camera. Tests put a stand-in in DEPTH['fn']."""
+    if DEPTH["fn"] is not None or DEPTH["tried"]:
+        return DEPTH["fn"]
+    DEPTH["tried"] = True
+    dc = CONFIG["shelf"]["depth"]
+    if not dc.get("enabled"):
+        DEPTH["err"] = "turned off in CONFIG"
+        return None
+    try:
+        import torch
+        from PIL import Image
+        from transformers import pipeline
+        dev = 0 if torch.cuda.is_available() else -1
+        pipe = pipeline("depth-estimation", model=dc["model"], device=dev)
+
+        def fn(bgr):
+            h, w = bgr.shape[:2]
+            out = pipe(Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)))
+            d = out["predicted_depth"]
+            d = (d.detach().float().cpu().numpy() if hasattr(d, "detach") else np.asarray(d, np.float32)).squeeze()
+            return cv2.resize(d.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+        DEPTH["fn"], DEPTH["name"] = fn, dc["model"].split("/")[-1]
+        print(f"[depth] {DEPTH['name']} loaded on {'GPU' if dev == 0 else 'CPU'}")
+    except ImportError:
+        DEPTH["err"] = "not installed — pip install transformers"
+    except Exception as e:
+        DEPTH["err"] = f"could not load: {type(e).__name__}: {str(e)[:120]}"
+    if DEPTH["err"]:
+        print(f"[depth] {DEPTH['err']} (depth counts off; using facings × depth)")
+    return DEPTH["fn"]
+
+
+def run_depth(bgr):
+    fn = depth_model()
+    if fn is None:
+        return None
+    with DEPTH["lock"]:                    # one model, several shelf cameras
+        return fn(bgr)
+
+
+def align_depth(d, d0, mask):
+    """Fit d0 ≈ a·d + b on pixels that should not change (shelf frame, walls, floor) and apply it
+    to d. A monocular model's scale drifts a few percent frame to frame — at 1.5 m that is a whole
+    unit — so live depth is always re-anchored to the calibration pass. Returns (aligned, noise_m)."""
+    x, y = d[mask], d0[mask]
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if x.size < 500:
+        return d, None
+    step = max(1, x.size // 40000)
+    x, y = x[::step].astype(np.float64), y[::step].astype(np.float64)
+    keep = np.ones(x.size, bool)
+    a, b = 1.0, 0.0
+    for _ in range(3):                     # trimmed least squares: drop what did change
+        A = np.stack([x[keep], np.ones(int(keep.sum()))], 1)
+        (a, b), *_ = np.linalg.lstsq(A, y[keep], rcond=None)
+        r = np.abs(a * x + b - y)
+        keep = r <= np.percentile(r, 70)
+    if not 0.6 < a < 1.6:                  # implausible — the view itself changed; don't trust it
+        return d, None
+    return (a * d + b).astype(np.float32), float(np.median(np.abs(a * x[keep] + b - y[keep])))
+
+
+def depth_region(box, w, h):
+    """Centre of a facing: where the front unit's face is, away from the gaps between columns."""
+    _, x0, y0, x1, y1 = box
+    mx, my = (x1 - x0) * 0.2, (y1 - y0) * 0.15
+    a, b = min(max(int(x0 + mx), 0), w - 1), min(max(int(y0 + my), 0), h - 1)
+    return a, b, min(max(int(x1 - mx), a + 1), w), min(max(int(y1 - my), b + 1), h)
+
+
+def nearest_surface(dist, unit, min_pts=6):
+    """Distance of the nearest real surface among the points in a column's tube. Depth models smear
+    the rim of a gap ('flying pixels' between near and far), so the nearest few points can't be
+    trusted; a unit's face is a dense cluster. Bins of half a unit: take the first bin holding a fair
+    share of the points, then the median of the points around it."""
+    if dist.size < min_pts:
+        return None
+    step = unit / 2
+    bins = np.floor(dist / step).astype(int)
+    lo = bins.min()
+    counts = np.bincount(bins - lo)
+    if counts.max() < min_pts:              # only smeared rim pixels: the column can't be seen
+        return None
+    need = max(min_pts, 0.3 * counts.max())
+    first = int(np.argmax(counts >= need))
+    centre = (first + lo + 0.5) * step
+    near = dist[np.abs(dist - centre) <= step]
+    return float(np.median(near))
+
+
+def backproject(d, hfov_deg):
+    """Depth map -> 3-D point per pixel (metres, camera frame: x right, y down, z forward)."""
+    h, w = d.shape
+    f = (w / 2) / math.tan(math.radians(hfov_deg) / 2)
+    u = (np.arange(w, dtype=np.float32) - w / 2 + 0.5) / f
+    v = (np.arange(h, dtype=np.float32) - h / 2 + 0.5) / f
+    return np.stack([d * u[None, :], d * v[:, None], d], -1)
+
+
+def shelf_frame(P0, slots, w, h):
+    """From the calibrated (full) shelf: the plane the product fronts stand on, and for every column
+    the patch of that plane its front unit covers. A unit taken from the front leaves the next one
+    further back along the plane's normal — inside the same 'tube', wherever that lands in the picture."""
+    per = {}
+    for s in slots:
+        for box in ShelfWorker.facing_boxes(s, w, h):
+            a, b, c2, d2 = depth_region(box, w, h)
+            q = P0[b:d2, a:c2].reshape(-1, 3)
+            q = q[np.isfinite(q).all(1)]
+            if len(q) >= 12:
+                per[(s["id"], box[0])] = (q, s)
+    if len(per) < 2:
+        return None
+    X = np.concatenate([q for q, _ in per.values()])
+    c = np.median(X, 0)
+    for _ in range(2):                       # plane through the fronts, robust to the odd stray point
+        _, _, vt = np.linalg.svd(X - c, full_matrices=False)
+        n = vt[2]
+        dist = np.abs((X - c) @ n)
+        X = X[dist <= np.percentile(dist, 80)]
+        c = X.mean(0)
+    n = n if n @ c > 0 else -n               # pointing away from the camera, into the shelf
+    e1 = np.array([1.0, 0, 0]) - n[0] * n
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(n, e1)
+    cols = {}
+    for k, (q, s) in per.items():
+        r = q - c
+        dn = r @ n
+        front0 = float(np.median(dn))
+        on = np.abs(dn - front0) < max(0.02, s["unit_cm"] / 200)
+        if on.sum() < 8:
+            continue
+        pa, pb = r[on] @ e1, r[on] @ e2
+        a0, a1 = np.percentile(pa, [5, 95])
+        b0, b1 = np.percentile(pb, [5, 95])
+        ma, mb = (a1 - a0) * 0.1, (b1 - b0) * 0.1
+        # last: points a unit face must show (live passes use every 2nd pixel each way)
+        cols[k] = (a0 + ma, a1 - ma, b0 + mb, b1 - mb, front0, max(6, int(on.sum() / 4 * 0.15)))
+    return {"c": c, "n": n, "e1": e1, "e2": e2, "cols": cols}
+
+
+def depth_colour(d, lo=None, hi=None):
+    """Depth map as a picture: near = bright red, far = dark (the dashboard's palette)."""
+    v = d[np.isfinite(d)]
+    lo = float(np.percentile(v, 2)) if lo is None else lo
+    hi = float(np.percentile(v, 98)) if hi is None else hi
+    n = np.clip((hi - d) / max(hi - lo, 1e-6), 0, 1)
+    n = np.nan_to_num(n)
+    img = np.zeros(d.shape + (3,), np.uint8)
+    img[..., 2] = (30 + 202 * n).astype(np.uint8)          # red rises as things get nearer
+    img[..., 1] = (22 + 32 * n ** 2).astype(np.uint8)
+    img[..., 0] = (25 + 54 * n ** 2).astype(np.uint8)
+    return img
+
+
 class ShelfWorker(CamWorker):
     """Grid over the opposite shelf. Each cell compared with a calibrated 'fully stocked' reference."""
 
@@ -1310,6 +1546,11 @@ class ShelfWorker(CamWorker):
         self.history = defaultdict(lambda: deque(maxlen=600))
         self.cells_map, self.calib_request, self.calib_msg = {}, False, None
         self.slot_ref, self.slot_sig = {}, None      # per-facing reference edges, rebuilt when slots change
+        # depth: the calibration pass (from the stored reference picture), per-column history, last result
+        self.depth_ref, self.depth_t, self.depth_jpg = None, 0.0, None
+        self.depth_geo, self.depth_geo_sig, self.depth_stack = None, None, []
+        self.depth_back = defaultdict(lambda: deque(maxlen=CONFIG["shelf"]["depth"]["smooth"]))
+        self.depth_state = {"on": False, "msg": "no product box has a unit depth set", "noise_cm": None}
 
     # ── product slots ────────────────────────────────────────────────
     def slots(self):
@@ -1341,9 +1582,115 @@ class ShelfWorker(CamWorker):
         e = self.edge_map(self.ref)
         h, w = self.ref.shape[:2]
         for s in slots:
-            self.slot_ref[s["id"]] = [float(e[y0:y1, x0:x1].mean())
+            self.slot_ref[s["id"]] = [float(e[y0:y1, x0:x1].mean()) if e[y0:y1, x0:x1].size else 0.0
                                       for _, x0, y0, x1, y1 in self.facing_boxes(s, w, h)]
         self.slot_sig = json.dumps(slots, sort_keys=True)
+
+    def depth_pass(self, frame, slots, persons):
+        """Measure how far back the front unit of every depth-enabled column now sits, versus the
+        calibration picture. Adds one reading (in units) per column to its short history."""
+        want = [s for s in slots if s.get("unit_cm", 0) > 0]
+        if not want:
+            self.depth_state = {"on": False, "msg": "no product box has a unit depth set", "noise_cm": None}
+            return
+        if self.ref is None or self.ref.shape != frame.shape:
+            return
+        if self.depth_ref is None:          # derived from the stored calibration picture
+            self.depth_ref = run_depth(self.ref)
+            self.depth_stack = [] if self.depth_ref is None else [self.depth_ref]
+        d = run_depth(frame) if self.depth_ref is not None else None
+        if d is None:
+            self.depth_state = {"on": False, "msg": DEPTH["err"] or "unavailable", "noise_cm": None}
+            return
+        h, w = frame.shape[:2]
+        mask = np.isfinite(self.depth_ref) & (self.depth_ref > 0)
+        for s in slots:                     # products may change; everything else should not
+            mask[int(s["y"] * h):int((s["y"] + s["h"]) * h), int(s["x"] * w):int((s["x"] + s["w"]) * w)] = False
+        for px1, py1, px2, py2 in persons:
+            mask[max(0, int(py1)):int(py2), max(0, int(px1)):int(px2)] = False
+        da, noise = align_depth(d, self.depth_ref, mask)
+        if noise is None:
+            self.depth_state = {"on": False, "msg": "view changed since calibration — re-calibrate", "noise_cm": None}
+            return
+        n_cal = CONFIG["shelf"]["depth"]["calib_passes"]
+        if len(self.depth_stack) < n_cal:   # the full-shelf depth is the median of a few passes
+            self.depth_stack.append(da)
+            self.depth_ref = np.median(np.stack(self.depth_stack), 0).astype(np.float32)
+            self.depth_geo = None
+            self.depth_state = {"on": False, "noise_cm": None,
+                                "msg": f"measuring the full shelf ({len(self.depth_stack)}/{n_cal}) — leave it untouched"}
+            return
+        hfov = self.hfov()
+        if self.depth_geo is None or self.depth_geo_sig != (self.slot_sig, hfov):
+            self.depth_geo = shelf_frame(backproject(self.depth_ref, hfov), want, w, h)
+            self.depth_geo_sig = (self.slot_sig, hfov)
+        geo = self.depth_geo
+        if geo is None:
+            self.depth_state = {"on": False, "msg": "could not find the shelf front in the depth map", "noise_cm": None}
+            return
+        # every pixel as a point in shelf coordinates: across (A), up/down (B), into the shelf (D)
+        P = backproject(da, hfov)[::2, ::2]
+        keep = np.isfinite(P).all(-1)
+        for px1, py1, px2, py2 in persons:
+            keep[max(0, int(py1) // 2):int(py2) // 2 + 1, max(0, int(px1) // 2):int(px2) // 2 + 1] = False
+        R = P[keep] - geo["c"]
+        A, B, D = R @ geo["e1"], R @ geo["e2"], R @ geo["n"]
+        for s in want:
+            x0, y0 = s["x"] * w, s["y"] * h
+            x1, y1 = x0 + s["w"] * w, y0 + s["h"] * h
+            blocked = any(max(0, min(x1, px2) - max(x0, px1)) * max(0, min(y1, py2) - max(y0, py1))
+                          > 0 for px1, py1, px2, py2 in persons)
+            if blocked:                     # someone in front: keep the last readings
+                continue
+            u = s["unit_cm"] / 100.0
+            for i in range(max(1, s["facings"])):
+                col = geo["cols"].get((s["id"], i))
+                if not col:
+                    continue
+                a0, a1, b0, b1, f0, npts = col
+                m = (A > a0) & (A < a1) & (B > b0) & (B < b1) & (D > f0 - u / 2) & (D < f0 + s["deep"] * u + 0.6)
+                front = nearest_surface(D[m] - f0, u, npts)     # metres behind the full front
+                # None: nothing solid visible in the tube — neighbours hide it from this angle
+                self.depth_back[(s["id"], i)].append(np.nan if front is None else front / u)
+        self.depth_state = {"on": True, "msg": f"{DEPTH['name'] or 'depth model'} · re-anchored every pass",
+                            "noise_cm": round(noise * 100, 1)}
+        # picture for the dashboard: nearer = brighter red, with each column's count
+        fronts = np.concatenate([self.depth_ref[int(s["y"] * h):int((s["y"] + s["h"]) * h),
+                                                 int(s["x"] * w):int((s["x"] + s["w"]) * w)].ravel() for s in want])
+        fronts = fronts[np.isfinite(fronts)]
+        lo = float(np.percentile(fronts, 5)) - 0.05 if fronts.size else 0.5
+        reach = max(s["deep"] * s["unit_cm"] / 100 for s in want) + 0.15
+        img = depth_colour(da, lo, lo + reach)          # colour range = the shelf's own depth
+        for s in want:
+            for box in self.facing_boxes(s, w, h):
+                i, a, b, c2, d2 = box
+                back = self.depth_units_back(s, i)
+                label = "?" if self.depth_hidden(s, i) else ("" if back is None else str(max(0, s["deep"] - back)))
+                cv2.rectangle(img, (a, b), (c2, d2), (220, 220, 220), 1)
+                if label:
+                    cv2.putText(img, label, (a + 3, b + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(img, "depth: nearer = brighter, number = units left in that column, ? = hidden", (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (200, 200, 200), 1, cv2.LINE_AA)
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        if ok:
+            self.depth_jpg = buf.tobytes()
+
+    def hfov(self):
+        cam = self.engine.layout.cam(self.name) if self.engine.layout else None
+        return float((cam or {}).get("fov") or CONFIG["shelf"]["depth"]["hfov_deg"])
+
+    def depth_hidden(self, s, i):
+        raw = self.depth_back.get((s["id"], i))
+        return bool(raw) and not np.isfinite(raw[-1]) and self.depth_state["on"]
+
+    def depth_units_back(self, s, i):
+        """Units missing from the front of column i (median of recent passes), or None."""
+        raw = self.depth_back.get((s["id"], i))
+        if not raw or not np.isfinite(raw[-1]):     # never seen, or hidden on the latest pass
+            return None
+        hist = [v for v in raw if np.isfinite(v)]
+        return int(np.clip(round(float(np.median(hist))), 0, s["deep"]))
 
     def read_slots(self, frame, slots, persons):
         sc = CONFIG["shelf"]
@@ -1352,6 +1699,10 @@ class ShelfWorker(CamWorker):
         sig = json.dumps(slots, sort_keys=True)
         if sig != self.slot_sig:
             self.build_slot_ref(slots)
+            self.depth_back.clear()
+        if now - self.depth_t >= sc["depth"]["every_s"]:
+            self.depth_t = now
+            self.depth_pass(frame, slots, persons)
         e = self.edge_map(frame)
         locs = slot_locations(slots)
         out = []
@@ -1366,28 +1717,48 @@ class ShelfWorker(CamWorker):
                 out.append({**prev, "occluded": True})
                 continue
             ref = self.slot_ref.get(s["id"]) or []
-            present, fills = 0, []
+            present, fills, cols = 0, [], []
+            nf = max(1, s["facings"])
+            backs = [self.depth_units_back(s, i) for i in range(nf)] \
+                if s.get("unit_cm", 0) > 0 and self.depth_state["on"] else [None] * nf
             for i, a, b, c2, d2 in self.facing_boxes(s, w, h):
-                cur = float(e[b:d2, a:c2].mean())
+                cur = float(e[b:d2, a:c2].mean()) if e[b:d2, a:c2].size else 0.0
                 r = ref[i] if i < len(ref) else 0.0
                 f = min(1.0, cur / r) if r > 1e-4 else (1.0 if cur > 0.02 else 0.0)
                 fills.append(f)
-                if f >= sc["slot_low"]:
+                if backs[i] is not None:     # depth: how many are gone from the front of this column
+                    left = max(0, s["deep"] - backs[i])
+                else:                        # not measured by depth: front-row rule
+                    left = s["deep"] if f >= sc["slot_low"] else 0
+                    if self.depth_hidden(s, i):
+                        # nothing solid in the column's tube: its front unit is certainly gone,
+                        # but neighbours hide how far back the rest goes from this angle
+                        left = min(left, s["deep"] - 1)
+                cols.append(left)
+                if left > 0:
                     present += 1
             n = max(1, s["facings"])
+            est = int(sum(cols))
+            nd = sum(v is not None for v in backs)
+            method = "depth" if nd == nf else ("mixed" if nd else "front")
+            full = n * s["deep"]
             fill = float(np.mean(fills)) if fills else 0.0
             self.recent[s["id"]].append(fill)
             fill_s = float(np.median(self.recent[s["id"]]))
             self.history[s["id"]].append((now, fill_s))
-            status = "EMPTY" if present == 0 else ("LOW" if present / n <= 0.5 else "OK")
+            status = "EMPTY" if est == 0 else ("LOW" if est / full <= 0.5 else "OK")
             p = self.engine.store.product_get(s.get("sku", "")) if s.get("sku") else None
             r_, c_ = locs.get(s["id"], (0, 0))
             cell = {"slot": s["id"], "name": p["name"] if p else s["name"], "sku": s.get("sku", ""),
                     "brand": p["brand"] if p else "", "price": p["price"] if p else None,
                     "row": r_, "col": c_, "loc": f"row {r_} · col {c_}",
                     "facings": n, "deep": s["deep"], "present": present,
-                    "est_units": present * s["deep"],      # an estimate: one camera cannot see behind row 1
-                    "full_units": n * s["deep"], "fill": round(fill_s, 2),
+                    # "depth": each column counted by how far back its front unit sits (depth model)
+                    # "front": facings still visible × stated depth — cannot see behind row 1
+                    "est_units": est, "method": method,
+                    "columns": cols if method != "front" else None,
+                    "hidden": [i for i in range(nf) if self.depth_hidden(s, i)],
+                    "full_units": full, "fill": round(fill_s, 2),
                     "status": status, "occluded": False,
                     "eta_min": self.eta(s["id"], now),
                     "pos_units": self.engine.pos_units(s.get("sku", ""), n * s["deep"])}
@@ -1446,6 +1817,8 @@ class ShelfWorker(CamWorker):
                 self.history.clear()
                 self.cells_map = {}
                 self.slot_sig = None                 # remeasure every facing against the new picture
+                self.depth_ref, self.depth_t, self.depth_geo = None, 0.0, None   # re-derived from the new picture
+                self.depth_back.clear()
                 sl = self.slots()
                 if sl:
                     self.build_slot_ref(sl)
@@ -1464,6 +1837,7 @@ class ShelfWorker(CamWorker):
         marked = self.slots()
         if marked:                                   # product slots beat the uniform grid
             cells = self.read_slots(frame, marked, persons)
+            self.engine.depth_info[self.name] = dict(self.depth_state)
             self.engine.on_shelf(self.name, cells)
             by = {c["slot"]: c for c in cells}
             for s in marked:
@@ -1480,7 +1854,8 @@ class ShelfWorker(CamWorker):
                 cv2.rectangle(vis, (x0, y0), (x1, y1), col, 2)
                 for _, a, b2, c3, d3 in self.facing_boxes(s, w, h):
                     cv2.line(vis, (a, b2), (a, d3), col, 1)
-                cv2.putText(vis, f"{s['name']} {c['present']}/{c['facings']}", (x0 + 4, max(12, y0 - 5)),
+                tag = "~" if c["method"] == "front" else ""
+                cv2.putText(vis, f"{s['name']} {tag}{c['est_units']}/{c['full_units']}", (x0 + 4, max(12, y0 - 5)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
             return vis
 
@@ -2199,11 +2574,13 @@ button.big{padding:10px 18px;font-size:14.5px;font-weight:600}
  <div class="bar2"><select id="shcam" onchange="shLoad(this.value)"></select><div class="sep"></div>
   <button id="b_draw" onclick="shDrawMode()">Draw product box</button>
   <button onclick="shCalibrate()">Calibrate (shelf full, aisle clear)</button><div class="sep"></div>
-  <button id="b_shsave" onclick="shSave()">Save products</button><span class="muted" id="shmsg"></span></div>
- <div class="wrap"><div class="shwrap" id="shwrap"><img id="shimg" alt=""><canvas id="shov"></canvas></div>
+  <button id="b_shsave" onclick="shSave()">Save products</button><div class="sep"></div>
+  <button id="b_depth" onclick="shView()">Depth view</button><span class="muted" id="shmsg"></span></div>
+ <div class="hint" id="shdepth" style="margin:-4px 0 8px"></div>
+ <div class="wrap"><div class="shwrap" id="shwrap"><img id="shimg" alt="" onerror="shImgErr()"><canvas id="shov"></canvas></div>
   <div class="side" id="shside"></div></div></section>
 <section class="card s12"><h3>Stock on this shelf
-  <span class="sub">camera estimate = facings seen × depth · till = restocked − sold</span></h3><div id="shtable"></div></section>
+  <span class="sub">depth = units counted per column by the depth model · front row = facings seen × units deep · till = restocked − sold</span></h3><div id="shtable"></div></section>
 <section class="card s12"><h3>Product catalog <span class="sub"><button onclick="prodEdit()">+ Product</button>
   <a class="lnk" href="/api/export/products.csv">Export CSV</a></span></h3>
  <div id="prodform"></div><div id="catalog"></div></section>
@@ -2404,16 +2781,17 @@ function side(){const o=selObj();let h=`<div class="box"><h4>Store size</h4>
   h+=`<div class="hint">rows × columns of product slots</div></div>`}
  else if(SEL.t==='c'){h+=`<div class="box"><h4>Camera</h4>
   <div class="f"><span>name</span><input type="text" value="${o.name}" oninput="selObj().name=this.value;dirty();draw()"></div>
-  <div class="f"><span>source</span><input type="text" value="${o.source||''}" placeholder="0 or http://…"
+  <div class="f"><span>source</span><input type="text" value="${o.source||''}" placeholder="0, or phone IP e.g. 192.168.1.5:8080"
    oninput="selObj().source=this.value;dirty()"></div>
+  <div class="hint" id="camfeed" style="margin:-2px 0 8px">${feedLine(o)}</div>
   ${f('x (m)',o.x,'selObj().x=+this.value;dirty();draw()')}${f('y (m)',o.y,'selObj().y=+this.value;dirty();draw()')}
   ${f('facing °',o.heading,'selObj().heading=+this.value;dirty();draw()',5)}
   ${f('lens angle °',o.fov,'selObj().fov=+this.value;dirty();draw()',5)}
   ${f('sees up to (m)',o.range,'selObj().range=+this.value;dirty();draw()',0.5)}
   <button class="danger" onclick="del()" style="margin-top:6px">Delete camera</button></div>
   <div class="box"><h4>This camera does</h4><div class="chips">`+
-  ['entry','queue','shelf'].map(r=>`<div class="chip ${(o.roles||[]).includes(r)?'on':''}"
-   onclick="tglRole('${r}')">${r==='entry'?'count people':r==='queue'?'watch queue':'watch shelves'}</div>`).join('')+
+  ['entry','queue','shelf','checkout'].map(r=>`<div class="chip ${(o.roles||[]).includes(r)?'on':''}"
+   onclick="tglRole('${r}')">${{entry:'count people',queue:'watch queue',shelf:'watch shelves',checkout:'self-checkout'}[r]}</div>`).join('')+
   `</div><div class="hint" style="margin-top:8px">${camNote(o)}</div></div>`}
  else h+=`<div class="box"><h4>Floor patch</h4>${f('x (m)',o.x,'selObj().x=+this.value;dirty();draw()')}
   ${f('y (m)',o.y,'selObj().y=+this.value;dirty();draw()')}${f('width (m)',o.w,'selObj().w=+this.value;dirty();draw()')}
@@ -2427,7 +2805,15 @@ function camNote(c){const r=c.roles||[];
  return 'Mark the entry line on the picture below.'}
 function tglFace(x){const s=selObj();if(s.faces[x])delete s.faces[x];else s.faces[x]={grid:[4,6]};dirty();side();draw()}
 function tglRole(r){const c=selObj();c.roles=c.roles||[];
- c.roles=c.roles.includes(r)?c.roles.filter(v=>v!==r):[...c.roles,r];dirty();side();draw()}
+ if(c.roles.includes(r))c.roles=c.roles.filter(v=>v!==r);
+ else if(r==='shelf'||r==='checkout')c.roles=[r];              // these need the camera to themselves
+ else c.roles=[...c.roles.filter(v=>v!=='shelf'&&v!=='checkout'),r];
+ dirty();side();draw()}
+function feedLine(c){if(!c)return'';const k=S&&S.cams&&S.cams[c.id];
+ if(!String(c.source||'').trim())return 'No source yet — a webcam number (0) or the phone\'s address from its camera app.';
+ if(DIRTY)return 'Save the plan to connect.';
+ if(!k)return 'Not running — save the plan to start it.';
+ return k.online?`<span style="color:#3fb950">● live</span> · ${k.fps} fps`:`<span style="color:#ff4d4f">● not connected</span> — ${esc(k.msg||'connecting…')}`}
 function del(){if(!SEL)return;
  if(SEL.t==='s')LAY.shelves=LAY.shelves.filter(s=>s.id!==SEL.id);
  else if(SEL.t==='c')LAY.cameras=LAY.cameras.filter(c=>c.id!==SEL.id);
@@ -2769,7 +3155,8 @@ function render(s){S=s;
   z.map(([n,v])=>`<tr><td>${esc(n)}</td><td>${v.visits}</td><td>${v.avg_dwell_s}s</td></tr>`).join('')+`</table>`:'';
  if(TABV==='home'){drawMini();homeCharts(s)}
  if(TABV==='setup'&&!DRAG)draw3d();
- if(TABV==='shelves'){shTable();shOv()}
+ if(TABV==='shelves'){shTable();shOv();shDepthLine()}
+ if(TABV==='setup'&&$('camfeed')&&SEL&&SEL.t==='c')$('camfeed').innerHTML=feedLine(selObj());
  if(TABV==='cctv')cctvBadges();
  coSync(s)}
 let HOMEKEY='';
@@ -2788,10 +3175,10 @@ async function shEnter(){const cams=shelfCams(),sel=$('shcam');
  await prodsLoad();catalog();
  if(cams.length){const want=SH.cam&&cams.find(c=>c.id===SH.cam)?SH.cam:cams[0].id;sel.value=want;
   if(want!==SH.cam||!SH.slots.length)await shLoad(want);else{shSide();shTable();shOv()}}}
-async function shLoad(cam){if(!cam)return;SH={cam,slots:[],sel:null,mode:null,drag:null,dirty:false};
+async function shLoad(cam){if(!cam)return;SH={cam,slots:[],sel:null,mode:null,drag:null,dirty:false,view:SH.view||'still'};
  const r=await fetch('/api/slots/'+cam);if(r.ok){const j=await r.json();
   SH.slots=j.slots.map(({row,col,product,...rest})=>rest);SH.calibrated=j.calibrated}
- $('shimg').src='/api/shelf/'+cam+'/still.jpg?t='+Date.now();$('b_shsave').className='';$('shmsg').textContent='';
+ shImg();$('b_shsave').className='';$('shmsg').textContent='';
  shSide();shTable();setTimeout(shSize,300)}
 function shSize(){const im=$('shimg'),ov=$('shov');if(!im||!ov)return;const w=im.clientWidth,h=im.clientHeight;
  if(w&&h&&(ov.width!==w||ov.height!==h)){ov.width=w;ov.height=h;ov.style.width=w+'px';ov.style.height=h+'px'}shOv()}
@@ -2838,7 +3225,7 @@ function shHit(px,py){const W=$('shov').width,H=$('shov').height;
  ov.addEventListener('pointerup',()=>{const d=SH.drag;SH.drag=null;if(!d)return;
   if(d.mode==='draw'){const x=Math.min(d.x0,d.x1),y=Math.min(d.y0,d.y1),w=Math.abs(d.x1-d.x0),h=Math.abs(d.y1-d.y0);
    if(w>0.02&&h>0.02){const id='p'+Date.now().toString(36);
-    SH.slots.push({id,name:'New product',sku:'',x:+x.toFixed(4),y:+y.toFixed(4),w:+w.toFixed(4),h:+h.toFixed(4),facings:1,deep:1});
+    SH.slots.push({id,name:'New product',sku:'',x:+x.toFixed(4),y:+y.toFixed(4),w:+w.toFixed(4),h:+h.toFixed(4),facings:1,deep:1,unit_cm:0});
     SH.sel=id;shDirty()}
    shDrawMode(false)}
   shSide();shOv()})})();
@@ -2869,13 +3256,17 @@ function shSide(){const s=SH.slots.find(x=>x.id===SH.sel);let h='';
    <div class="f"><span>side by side (facings)</span><input type="number" min="1" max="30" value="${s.facings}"
     oninput="SHS('facings',this.value)"></div>
    <div class="f"><span>units deep</span><input type="number" min="1" max="30" value="${s.deep}" oninput="SHS('deep',this.value)"></div>
-   <div class="hint">A full box holds <b id="sh_full">${s.facings*s.deep}</b> units. The camera sees the front row, so the
-    live count is an estimate: facings still visible × units deep.</div>
+   <div class="f"><span>one unit, front to back (cm)</span><input type="number" min="0" max="60" step="0.5" value="${s.unit_cm||''}"
+    placeholder="e.g. 7" oninput="SHU(this.value)"></div>
+   <div class="hint">A full box holds <b id="sh_full">${s.facings*s.deep}</b> units. With the unit size set, the depth model
+    measures how far back the front unit of each column sits and counts what's left behind it. Without it, the count is
+    an estimate: facings still visible × units deep.</div>
    <button class="danger" style="margin-top:8px" onclick="shDel()">Remove box</button></div>`;
   const lc=liveCell(s.id);
   if(lc&&!SH.dirty)h+=`<div class="box"><h4>Right now</h4><div class="f"><span>status</span><span class="st ${lc.status}">${lc.status}</span></div>
    <div class="f"><span>facings visible</span><b>${lc.present} / ${lc.facings}</b></div>
-   <div class="f"><span>camera estimate</span><b>~${lc.est_units} / ${lc.full_units}</b></div>
+   <div class="f"><span>camera count</span><b>${lc.method==='front'?'~':''}${lc.est_units} / ${lc.full_units}</b></div>
+   <div class="f"><span>counted by</span><span>${lc.method==='front'?'front row × units deep':'depth model, per column: '+lc.columns.join(' · ')+(lc.hidden&&lc.hidden.length?` (column ${lc.hidden.map(i=>i+1).join(', ')} hidden from this angle — front unit gone, rest unseen)`:'')}</span></div>
    <div class="f"><span>by the till</span><b>${lc.pos_units==null?'—':lc.pos_units}</b></div>
    <div class="f"><span>where</span><span>${esc(lc.loc)}</span></div></div>`}
  $('shside').innerHTML=h}
@@ -2889,6 +3280,16 @@ function SHN(k,v){const s=SH.slots.find(x=>x.id===SH.sel);s._new[k]=v;
  if(k==='sku')s._new._skuTouched=true;shDirty();shOv()}
 function SHS(k,v){const s=SH.slots.find(x=>x.id===SH.sel);s[k]=Math.max(1,Math.min(30,parseInt(v)||1));shDirty();shOv();
  const f=$('sh_full');if(f)f.textContent=s.facings*s.deep}
+function SHU(v){const s=SH.slots.find(x=>x.id===SH.sel);s.unit_cm=Math.max(0,Math.min(60,parseFloat(v)||0));shDirty()}
+function shView(){SH.view=SH.view==='depth'?'still':'depth';$('b_depth').className=SH.view==='depth'?'on':'';shImg()}
+function shImg(){if(!SH.cam)return;$('shimg').src=SH.view==='depth'?'/api/depth/'+SH.cam+'.jpg?t='+Date.now()
+  :'/api/shelf/'+SH.cam+'/still.jpg?t='+Date.now()}
+setInterval(()=>{if(TABV==='shelves'&&SH.view==='depth')shImg()},3000);
+function shImgErr(){if(SH.view!=='depth')return;SH.view='still';$('b_depth').className='';shImg();
+ const d=S&&S.depth&&S.depth[SH.cam];$('shmsg').textContent='No depth picture yet — '+(d&&!d.on?d.msg:'set a unit size on a product box and wait a few seconds')}
+function shDepthLine(){const el=$('shdepth');if(!el)return;const d=S&&S.depth&&S.depth[SH.cam];
+ el.innerHTML=!d?'':d.on?`Depth model on — ${esc(d.msg)}${d.noise_cm!=null?` · fit error ${d.noise_cm} cm`:''}`
+  :`Depth model off — ${esc(d.msg)}`}
 function shDel(){SH.slots=SH.slots.filter(s=>s.id!==SH.sel);SH.sel=null;shDirty();shSide();shOv()}
 addEventListener('keydown',e=>{if(TABV!=='shelves'||!SH.sel||/INPUT|SELECT/.test(document.activeElement.tagName))return;
  if(e.key==='Delete'||e.key==='Backspace'){e.preventDefault();shDel()}});
@@ -2905,18 +3306,18 @@ async function shSave(){const msg=$('shmsg');
  await prodsLoad();catalog();shSide();shOv()}
 async function shCalibrate(){if(!SH.cam)return;$('shmsg').textContent='calibrating…';
  const j=await(await fetch('/api/calibrate/'+SH.cam,{method:'POST'})).json();$('shmsg').textContent=j.message;
- if(/Calibrated/.test(j.message)){SH.calibrated=true;$('shimg').src='/api/shelf/'+SH.cam+'/still.jpg?t='+Date.now();shSide()}}
+ if(/Calibrated/.test(j.message)){SH.calibrated=true;shImg();shSide()}}
 function shTable(){const el=$('shtable');if(!el||!S)return;const cells=(S.shelves[SH.cam]||[]);
  if(!SH.cam){el.innerHTML='';return}
  if(!cells.length){el.innerHTML=`<div class="empty">${SH.calibrated?'Waiting for the camera…':'Not calibrated yet.'}</div>`;return}
  if(!cells[0].slot){el.innerHTML=`<div class="hint" style="margin-bottom:8px">No product boxes yet — showing the fallback grid.
    Draw boxes above for per-product counts.</div>`+gridCells(cells);return}
- el.innerHTML=`<table><tr><th>Where</th><th>Product</th><th>Facings seen</th><th>Camera estimate</th><th>By the till</th>
+ el.innerHTML=`<table><tr><th>Where</th><th>Product</th><th>Facings seen</th><th>Camera count</th><th>By the till</th>
   <th>Status</th><th>Runs out</th></tr>`+cells.slice().sort((a,b)=>a.row-b.row||a.col-b.col).map(c=>`<tr>
   <td class="muted">${esc(c.loc)}</td><td>${esc(c.name)}${c.brand?`<div class="muted">${esc(c.brand)}</div>`:''}</td>
   <td><div style="display:flex;align-items:center;gap:8px"><div class="bar-in" style="flex:1"><div style="width:${100*c.present/c.facings}%;
    background:${SCOL[c.status]||'#3fb950'}"></div></div><span>${c.present}/${c.facings}</span></div></td>
-  <td>~${c.est_units} <span class="muted">/ ${c.full_units}</span></td><td>${c.pos_units==null?'<span class="muted">—</span>':c.pos_units}</td>
+  <td>${c.method==='front'?'~':''}${c.est_units} <span class="muted">/ ${c.full_units} · ${{depth:'depth',mixed:'depth, part hidden',front:'front row'}[c.method]||''}</span></td><td>${c.pos_units==null?'<span class="muted">—</span>':c.pos_units}</td>
   <td><span class="st ${c.occluded?'occ':c.status}">${c.occluded?'BLOCKED':c.status}</span></td>
   <td class="muted">${c.eta_min!=null?'~'+Math.round(c.eta_min)+' min':''}</td></tr>`).join('')+`</table>`}
 function gridCells(cells){const C=Math.max(...cells.map(c=>c.c))+1;
@@ -3066,7 +3467,8 @@ async function loadLay(){const j=await(await fetch('/api/layout')).json();LAY=j.
 async function saveLay(){const j=await(await fetch('/api/layout',{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify(LAY)})).json();
  if(!j.ok)return alert(j.error||'save failed');
- LAY=j.layout;DIRTY=false;$('b_save').className='';$('saved').textContent='saved · restart to apply new sources';
+ LAY=j.layout;DIRTY=false;$('b_save').className='';const cs=j.cams||{},er=Object.values(cs.errors||{});
+ $('saved').textContent='saved'+((cs.starting||[]).length?' · starting '+cs.starting.join(', '):'')+(er.length?' · '+er.join('; '):'');
  side();draw();draw3d()}
 async function report(p){const j=await(await fetch('/api/report?period='+p)).json();
  const rows=[['Footfall',j.footfall_total],['Peak',j.peak||'—'],['Customers billed',j.customers_billed],
@@ -3078,6 +3480,69 @@ async function report(p){const j=await(await fetch('/api/report?period='+p)).jso
   <a href="/api/report?period=${p}" target="_blank" style="color:var(--acc2)">Download JSON</a>`}
 loadLay().then(()=>tab(location.hash.slice(1)||'home'));
 </script></body></html>"""
+
+
+def check_roles(name, roles):
+    """Role set for a camera, or raises ValueError with a message people can act on."""
+    roles = {r.strip() for r in roles if r.strip()}
+    if not roles or not roles <= {"entry", "queue", "shelf", "checkout"}:
+        raise ValueError(f"{name}: unknown role in {sorted(roles)}")
+    for solo in ("shelf", "checkout"):
+        if solo in roles and len(roles) > 1:
+            raise ValueError(f"{name}: a {solo} camera can't also do other jobs")
+    return roles
+
+
+def start_cam(engine, workers, name, roles, src, from_layout=False):
+    roles = check_roles(name, roles)
+    cls = ShelfWorker if "shelf" in roles else CheckoutWorker if "checkout" in roles else PeopleWorker
+    w = cls(name, roles, src, engine)
+    w.from_layout = from_layout
+    workers[name] = w
+    w.start()
+    print(f"[{name}] {','.join(sorted(roles))} <- {w.cap.src}")
+    return w
+
+
+def sync_cams(engine, workers):
+    """Make the running cameras match the saved store plan: start new ones, restart ones whose
+    source or job changed, stop ones removed. No server restart needed after editing the plan."""
+    plan = {c["id"]: c for c in engine.layout.data["cameras"] if str(c.get("source", "")).strip()}
+    todo, errors = [], {}
+    for name, w in list(workers.items()):
+        c = plan.get(name)
+        same = c and normalise_source(c["source"]) == normalise_source(w.source) and set(c["roles"]) == set(w.roles)
+        if same:
+            continue
+        if c is None and not getattr(w, "from_layout", False):
+            continue                            # started with --cam and no source in the plan: leave it
+        w.stop()
+        workers.pop(name, None)
+        with engine.lock:
+            engine.cams.pop(name, None)
+        print(f"[{name}] stopped")
+    for name, c in plan.items():
+        if name in workers:
+            continue
+        try:
+            check_roles(name, c["roles"])
+            todo.append((name, c["roles"], c["source"]))
+            with engine.lock:
+                engine.cams[name] = {"roles": sorted(c["roles"]), "online": False, "fps": 0, "people": 0,
+                                     "msg": "starting…"}
+        except ValueError as e:
+            errors[name] = str(e)
+
+    def go():
+        for name, roles, src in todo:
+            try:
+                start_cam(engine, workers, name, roles, src, from_layout=True)
+            except Exception as e:
+                with engine.lock:
+                    engine.cams[name] = {"roles": sorted(roles), "online": False, "fps": 0, "people": 0,
+                                         "msg": f"couldn't start: {type(e).__name__}: {e}"}
+    threading.Thread(target=go, daemon=True).start()   # loading models takes a moment
+    return {"starting": [t[0] for t in todo], "errors": errors}
 
 
 def make_app(engine, workers, store):
@@ -3141,7 +3606,8 @@ def make_app(engine, workers, store):
             if hasattr(w, "storeH"):
                 w.storeH = w.H = None
                 w._quad = w._rect = None
-        return {"ok": True, "layout": data, "coverage": coverage(data)}
+        cams = sync_cams(engine, workers)       # new/changed sources start now, no restart
+        return {"ok": True, "layout": data, "coverage": coverage(data), "cams": cams}
 
     @app.get("/api/layout/3d.png")
     def layout_3d(el: float = 34, az: float = -62):
@@ -3189,6 +3655,15 @@ def make_app(engine, workers, store):
             raise HTTPException(404, "no picture yet")
         ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return Response(buf.tobytes(), media_type="image/jpeg")
+
+    @app.get("/api/depth/{cam}.jpg")
+    def depth_view(cam: str):
+        """Latest depth pass of a shelf camera, coloured, with each column's unit count."""
+        w = workers.get(cam)
+        jpg = getattr(w, "depth_jpg", None) if w else None
+        if not jpg:
+            raise HTTPException(404, (getattr(w, "depth_state", None) or {}).get("msg", "no depth pass yet"))
+        return Response(jpg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
     @app.get("/api/slots/{cam}")
     def get_slots(cam: str):
@@ -3365,6 +3840,44 @@ def pick(source):
     print(json.dumps(pts))
 
 
+def depth_test(paths):
+    """Run the depth model on your own shelf photos. With two photos taken from the same spot —
+    shelf full, then with some front units removed — it shows how far back each part moved (cm)."""
+    imgs = [cv2.imread(p) for p in paths[:2]]
+    if any(i is None for i in imgs):
+        sys.exit("could not read " + ", ".join(p for p, i in zip(paths, imgs) if i is None))
+    t = time.time()
+    d0 = run_depth(imgs[0])
+    if d0 is None:
+        sys.exit(f"depth model {DEPTH['err']}")
+    print(f"depth pass: {time.time() - t:.2f} s (first pass includes loading)")
+    h, w = d0.shape
+    print(f"distance at the centre of {paths[0]}: {float(np.median(d0[h // 2 - 5:h // 2 + 5, w // 2 - 5:w // 2 + 5])):.2f} m")
+    tiles = [imgs[0], depth_colour(d0)]
+    if len(imgs) == 2:
+        if imgs[1].shape != imgs[0].shape:
+            imgs[1] = cv2.resize(imgs[1], (w, h))
+        d1 = run_depth(imgs[1])
+        diff = cv2.absdiff(cv2.cvtColor(imgs[0], cv2.COLOR_BGR2GRAY), cv2.cvtColor(imgs[1], cv2.COLOR_BGR2GRAY))
+        stable = cv2.GaussianBlur(diff, (21, 21), 0) < 12      # parts of the picture that did not change
+        da, noise = align_depth(d1, d0, stable)
+        if noise is None:
+            print("the two photos don't line up — take both from exactly the same spot")
+        else:
+            moved = np.clip((da - d0) * 100, 0, 30)             # cm further away than before
+            vis = cv2.applyColorMap((moved / 30 * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+            vis[stable] = (vis[stable] * 0.35).astype(np.uint8)
+            cv2.putText(vis, "moved back, 0-30 cm", (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            print(f"fit error on unchanged parts: {noise * 100:.1f} cm")
+            ch = ~stable
+            if ch.any():
+                print(f"changed area moved back by a median {float(np.median((da - d0)[ch])) * 100:.1f} cm")
+            tiles += [imgs[1], vis]
+    out = np.hstack([cv2.resize(x, (w // 2, h // 2)) for x in tiles])
+    cv2.imwrite("depth_test.png", out)
+    print("wrote depth_test.png")
+
+
 def deep_merge(a, b):
     for k, v in b.items():
         if isinstance(v, dict) and isinstance(a.get(k), dict):
@@ -3387,6 +3900,9 @@ def main():
                     help="fill the analytics with generated past trading (tagged as demo data)")
     ap.add_argument("--clear-demo", action="store_true", help="delete generated demo data and exit")
     ap.add_argument("--pick", metavar="SOURCE", help="click points on a frame to get geometry coords")
+    ap.add_argument("--depth-test", nargs="+", metavar="PHOTO",
+                    help="check the depth model: one shelf photo, or two (full, then with units taken) "
+                         "to see how far back each spot moved; writes depth_test.png and exits")
     args = ap.parse_args()
 
     if args.config:
@@ -3400,6 +3916,8 @@ def main():
         CONFIG["layout_path"] = args.layout
     if args.pick:
         return pick(args.pick)
+    if args.depth_test:
+        return depth_test(args.depth_test)
 
     try:                       # nothing leaves the device: kill the model library's usage telemetry
         from ultralytics import settings as ul_settings
@@ -3425,16 +3943,10 @@ def main():
         cams = [["cam0", "entry,queue", "0"]]
         print("no --cam and no camera sources in the layout: using the laptop webcam")
     for name, roles, src in cams:
-        roles = {r.strip() for r in roles.split(",") if r.strip()}
-        if not roles <= {"entry", "queue", "shelf", "checkout"}:
-            sys.exit(f"Unknown role in {roles}")
-        for solo in ("shelf", "checkout"):
-            if solo in roles and len(roles) > 1:
-                sys.exit(f"{name}: a {solo} camera can't have other roles")
-        cls = ShelfWorker if "shelf" in roles else CheckoutWorker if "checkout" in roles else PeopleWorker
-        workers[name] = cls(name, roles, src, engine)
-        workers[name].start()
-        print(f"[{name}] {','.join(sorted(roles))} <- {src}")
+        try:
+            start_cam(engine, workers, name, roles.split(","), src, from_layout=not args.cam)
+        except ValueError as e:
+            sys.exit(str(e))
 
     threading.Thread(target=ticker, args=(engine, store), daemon=True).start()
     threading.Thread(target=cloud_sync, args=(engine, store), daemon=True).start()
