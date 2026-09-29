@@ -7,7 +7,7 @@ for f in ("cams.db", "cams_layout.json"):
     if os.path.exists(f):
         os.remove(f)
 
-import numpy as np, torch
+import numpy as np, torch, cv2
 import ultralytics
 
 
@@ -114,8 +114,80 @@ cli.post("/api/layout", json={"store": {"w": 6, "h": 4}, "shelves": [],
 check("--cam camera not in the plan's sources is left running", workers.get("cli") is w and w.is_alive())
 w.stop()
 
+print("\nphone stream lag")
+import threading, socketserver, http.server
+SENT, STOP = [0], [False]
+FRS = []
+for i in range(256):
+    im = np.random.default_rng(i).integers(0, 255, (720, 1280, 3), dtype=np.uint8)
+    for bit in range(8):
+        im[0:60, bit * 90:bit * 90 + 60] = 255 if (i >> bit) & 1 else 0
+    FRS.append(cv2.imencode(".jpg", im, [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes())
+
+
+class Phone(http.server.BaseHTTPRequestHandler):      # behaves like IP Webcam's /video
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace;boundary=Ba4oTvQMY8ew04N8dcnM")
+        self.end_headers()
+        n, t0 = 0, time.time()
+        try:
+            while not STOP[0]:
+                j = FRS[n % 256]
+                self.wfile.write(b"--Ba4oTvQMY8ew04N8dcnM\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(j) + j + b"\r\n")
+                SENT[0] = n
+                n += 1
+                time.sleep(max(0, t0 + n / 30 - time.time()))
+        except Exception:
+            pass
+
+
+class TS(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+
+srv = TS(("127.0.0.1", 8766), Phone)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+cap = ss.Capture("127.0.0.1:8766")
+time.sleep(1.0)
+lags = []
+for _ in range(20):                              # a slow worker: 5 frames a second from a 30 fps phone
+    f = cap.read()
+    if f is not None:
+        got = sum(1 << b for b in range(8) if f[30, b * 90 + 30].mean() > 127)
+        lags.append((SENT[0] - got) % 256)
+    time.sleep(0.2)
+check("slow reader stays within 3 frames (0.1 s) of the phone", lags and max(lags[3:]) <= 3, str(lags))
+seq = cap.seq
+STOP[0] = True                                   # phone app closed
+srv.shutdown()
+time.sleep(0.5)
+check("no new frames -> sequence stops, workers don't redo old frames", cap.seq - seq <= 3, f"{cap.seq - seq}")
+check("phone gone -> says why", wait(lambda: "same Wi-Fi" in cap.status, 10), cap.status)
+cap.stop()
+
+print("\nframe endpoint")
+r = cli.get("/api/frame/ghost.jpg")
+check("unknown camera -> a picture that says why, not an error",
+      r.status_code == 200 and r.headers["content-type"] == "image/jpeg")
+w2 = ss.start_cam(eng, workers, "walk", ["entry"], "../demo/walk.mp4")
+wait(lambda: eng.snapshot()["cams"].get("walk", {}).get("online"))
+wait(lambda: w2.jpg is not None)
+r = cli.get("/api/frame/walk.jpg")
+check("live camera -> its latest frame", r.content == w2.jpg or len(r.content) > 5000)
+src_fps = cv2.VideoCapture("../demo/walk.mp4").get(cv2.CAP_PROP_FPS)
+time.sleep(6)
+fps = eng.snapshot()["cams"]["walk"]["fps"]
+check("fps shown is the camera's real frame rate, not processing speed", 0.6 * src_fps < fps < 1.3 * src_fps,
+      f"shown {fps}, video {src_fps:.0f}")
+w2.stop()
+
 page = cli.get("/").text
 check("setup shows the feed status and a self-checkout job", "feedLine" in page and "self-checkout" in page)
+check("dashboard uses paced frames, no open-ended streams", "liveTick" in page and 'src="/video/' not in page)
 for f in ("cams.db", "cams_layout.json"):
     if os.path.exists(f):
         os.remove(f)

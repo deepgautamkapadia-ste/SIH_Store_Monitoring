@@ -105,6 +105,7 @@ CONFIG = {
     "pos": {"rescan_s": 2.0},       # an item must leave the checkout camera's view this long to count again
     "layout_path": "layout.json",   # the store model: shelves and cameras in metres
     "store_cell_m": 0.25,           # floor-heatmap resolution in the store frame
+    "max_width": 1280,              # camera frames are shrunk to this width (phones send 1080p+)
 }
 
 
@@ -380,7 +381,10 @@ class Capture:
         self.is_file = isinstance(self.src, str) and not self.src.startswith(("http", "rtsp")) and os.path.exists(self.src)
         self.frame, self.lock = None, threading.Lock()
         self.alive, self.status, self.fails = True, "connecting…", 0
-        threading.Thread(target=self._run, daemon=True).start()
+        self.seq = 0                          # bumps on every new frame, so workers skip repeats
+        self.jpeg, self.jpeg_seq, self.dec_seq = None, 0, 0
+        http = isinstance(self.src, str) and self.src.startswith(("http://", "https://"))
+        threading.Thread(target=self._run_http if http else self._run, daemon=True).start()
 
     def stop(self):
         self.alive = False
@@ -412,6 +416,66 @@ class Capture:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
 
+    def _fit(self, f):
+        """Phones send 1080p+; nothing here needs more than max_width, and big frames cost CPU and lag."""
+        mw = CONFIG.get("max_width") or 0
+        if f is not None and mw and f.shape[1] > mw:
+            f = cv2.resize(f, (mw, int(f.shape[0] * mw / f.shape[1])), interpolation=cv2.INTER_AREA)
+        return f
+
+    def _run_http(self):
+        """Phone cameras (IP Webcam, DroidCam) stream MJPEG over HTTP. Read the bytes ourselves and keep
+        only the newest complete JPEG: if the laptop falls behind, old frames are dropped instead of
+        queueing up — which is what made OpenCV's reader lag further and further behind the phone.
+        Frames are decoded only when a worker asks for one."""
+        import urllib.request
+        while self.alive:
+            try:
+                r = urllib.request.urlopen(self.src, timeout=5)
+                ctype = r.headers.get("Content-Type", "")
+                if "multipart" not in ctype.lower():
+                    r.close()
+                    return self._run()           # not MJPEG (e.g. an HLS page): let OpenCV try
+                bnd = ctype.split("boundary=")[-1].strip().strip('"').lstrip("-").encode() if "boundary=" in ctype else b""
+                buf = b""
+                while self.alive:
+                    chunk = r.read1(262144) if hasattr(r, "read1") else r.read(65536)
+                    if not chunk:
+                        raise IOError("stream ended")
+                    buf += chunk
+                    got = None
+                    if bnd:                      # complete parts sit between two boundaries
+                        cuts = [i for i in self._find_all(buf, bnd)]
+                        if len(cuts) >= 2:
+                            part = buf[cuts[-2]:cuts[-1]]
+                            got = part[part.find(b"\xff\xd8"):] if b"\xff\xd8" in part else None
+                            buf = buf[cuts[-1]:]
+                    else:                        # no boundary given: split on JPEG start/end markers
+                        e = buf.rfind(b"\xff\xd9")
+                        st = buf.rfind(b"\xff\xd8", 0, e) if e > 0 else -1
+                        if st >= 0:
+                            got, buf = buf[st:e + 2], buf[e + 2:]
+                    if got:
+                        with self.lock:
+                            self.jpeg, self.jpeg_seq = got, self.jpeg_seq + 1
+                        self.fails, self.status = 0, "live"
+                    if len(buf) > 16_000_000:
+                        buf = b""
+                r.close()
+            except Exception:
+                with self.lock:
+                    self.jpeg, self.frame = None, None
+                self.fails += 1
+                self.status = self.why() + (f" (retrying, attempt {self.fails})" if self.fails > 1 else "")
+                time.sleep(min(1.0 + self.fails * 0.5, 5.0))
+
+    @staticmethod
+    def _find_all(buf, pat):
+        i = buf.find(pat)
+        while i != -1:
+            yield i
+            i = buf.find(pat, i + len(pat))
+
     def _run(self):
         cap = self._open()
         fps = cap.get(cv2.CAP_PROP_FPS) or 25
@@ -433,13 +497,24 @@ class Capture:
                     cap = self._open()
                     continue
             self.fails, self.status = 0, "live"
+            f = self._fit(f)
             with self.lock:
-                self.frame = f
+                self.frame, self.seq = f, self.seq + 1
             if self.is_file:
                 time.sleep(1.0 / max(fps, 1))
         cap.release()
 
     def read(self):
+        with self.lock:
+            if self.jpeg is not None and self.jpeg_seq != self.dec_seq:
+                jpg, self.dec_seq = self.jpeg, self.jpeg_seq
+            else:
+                jpg = None
+        if jpg is not None:                      # decode outside the lock; only frames someone uses
+            f = self._fit(cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR))
+            if f is not None:
+                with self.lock:
+                    self.frame, self.seq = f, self.seq + 1
         with self.lock:
             return None if self.frame is None else self.frame.copy()
 
@@ -1090,7 +1165,7 @@ class CamWorker(threading.Thread):
         self.source, self.alive = source, True
         self.cap = Capture(source)
         self.jpg, self.fps = None, 0.0
-        self.t_prev = self.t_start = time.time()
+        self.t_prev = self.t_start = self.t_shown = time.time()
         self.cctv_jpg, self.cctv_want, self.people = None, 0.0, 0
 
     def cctv(self, frame, boxes):
@@ -1121,12 +1196,17 @@ class CamWorker(threading.Thread):
         self.cap.stop()
 
     def run(self):
+        last = -1
         while self.alive:
             f = self.cap.read()
             if f is None:
                 self.engine.cam_status(self.name, self.roles, False, 0, msg=self.cap.status)
                 time.sleep(0.3)
                 continue
+            if self.cap.seq == last:             # nothing new from the camera yet: don't redo work
+                time.sleep(0.005)
+                continue
+            last = self.cap.seq
             t = time.time()
             try:
                 vis = self.step(f)
@@ -1134,7 +1214,9 @@ class CamWorker(threading.Thread):
                 print(f"[{self.name}] {type(e).__name__}: {e}")
                 time.sleep(1.0)
                 continue
-            self.fps = 0.9 * self.fps + 0.1 / max(time.time() - t, 1e-3)
+            # frames actually shown per second (was: how fast one frame is processed — misleading)
+            self.fps = 0.9 * self.fps + 0.1 / max(t - self.t_shown, 1e-3)
+            self.t_shown = t
             ok, buf = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 self.jpg = buf.tobytes()
@@ -2575,7 +2657,8 @@ button.big{padding:10px 18px;font-size:14.5px;font-weight:600}
   <button id="b_draw" onclick="shDrawMode()">Draw product box</button>
   <button onclick="shCalibrate()">Calibrate (shelf full, aisle clear)</button><div class="sep"></div>
   <button id="b_shsave" onclick="shSave()">Save products</button><div class="sep"></div>
-  <button id="b_depth" onclick="shView()">Depth view</button><span class="muted" id="shmsg"></span></div>
+  <button id="b_vstill" onclick="shView('still')">Still</button><button id="b_vlive" onclick="shView('live')">Live</button><button id="b_depth" onclick="shView('depth')">Depth</button>
+  <span class="muted" id="shmsg"></span></div>
  <div class="hint" id="shdepth" style="margin:-4px 0 8px"></div>
  <div class="wrap"><div class="shwrap" id="shwrap"><img id="shimg" alt="" onerror="shImgErr()"><canvas id="shov"></canvas></div>
   <div class="side" id="shside"></div></div></section>
@@ -2851,7 +2934,7 @@ function camSetup(){const box=$('camsetup');
  if(CAMUI===c.id){modeBtns(c);ovDraw();return}          // same camera: don't reload the feed
  CAMUI=c.id;PICK=null;
  $('camsetupbody').innerHTML=`<div class="bar2" id="pkbar"></div>
-  <div class="feedwrap"><img id="feed" src="/video/${c.id}"><canvas id="ov"></canvas></div>
+  <div class="feedwrap"><img id="feed" class="live" data-cam="${esc(c.id)}"><canvas id="ov"></canvas></div>
   <div class="hint" style="margin-top:8px">Pick a tool, then click on the picture. The entry line is where
   people are counted; the arrow shows which way counts as coming in. Floor points are the four corners of a
   floor rectangle, which ties this camera into the store map.</div>`;
@@ -2983,10 +3066,15 @@ function tab(t){if(!TABS.includes(t))t='home';TABV=t;
  if(t==='cctv')cctvBuild()}
 document.querySelectorAll('#tabs .tab').forEach(el=>el.onclick=()=>tab(el.dataset.t));
 /* live video only streams on the tab you are looking at — each MJPEG feed costs the edge box */
-function streams(){document.querySelectorAll('main img').forEach(im=>{
- const on=im.closest('main').id===TABV,src=im.getAttribute('src')||'';
- if(!on&&src.startsWith('/video/')){im.dataset.stream=src;im.removeAttribute('src')}
- else if(on&&!src&&im.dataset.stream)im.src=im.dataset.stream})}
+function streams(){}   // live pictures pace themselves (liveTick) and pause when hidden
+/* live pictures: every <img class="live" data-cam data-view> asks for its next frame only after the last
+   one has arrived. A slow link drops frames instead of falling behind, nothing holds a connection open
+   (browsers allow only 6 per site), and hidden tabs make no requests at all. */
+function liveTick(){document.querySelectorAll('img.live').forEach(im=>{
+ if(im._busy||!im.isConnected||im.offsetParent===null)return;
+ im._busy=true;im.onload=im.onerror=()=>{im._busy=false};
+ im.src='/api/frame/'+encodeURIComponent(im.dataset.cam)+'.jpg?view='+(im.dataset.view||'analytics')+'&t='+Date.now()})}
+setInterval(liveTick,60);
 
 /* ---------- chart kit (dark surface, validated pair red #e8364f / slate #5b8fd1) ---------- */
 const CC={s1:'#e8364f',s2:'#5b8fd1',rest:'#454b55',grid:'#20242a',axis:'#343941'};
@@ -3156,6 +3244,7 @@ function render(s){S=s;
  if(TABV==='home'){drawMini();homeCharts(s)}
  if(TABV==='setup'&&!DRAG)draw3d();
  if(TABV==='shelves'){shTable();shOv();shDepthLine()}
+ if(TABV==='cctv'&&Object.keys(S.cams||{}).join('|')!==CCTVSIG)cctvBuild();   // a camera joined or left
  if(TABV==='setup'&&$('camfeed')&&SEL&&SEL.t==='c')$('camfeed').innerHTML=feedLine(selObj());
  if(TABV==='cctv')cctvBadges();
  coSync(s)}
@@ -3281,11 +3370,15 @@ function SHN(k,v){const s=SH.slots.find(x=>x.id===SH.sel);s._new[k]=v;
 function SHS(k,v){const s=SH.slots.find(x=>x.id===SH.sel);s[k]=Math.max(1,Math.min(30,parseInt(v)||1));shDirty();shOv();
  const f=$('sh_full');if(f)f.textContent=s.facings*s.deep}
 function SHU(v){const s=SH.slots.find(x=>x.id===SH.sel);s.unit_cm=Math.max(0,Math.min(60,parseFloat(v)||0));shDirty()}
-function shView(){SH.view=SH.view==='depth'?'still':'depth';$('b_depth').className=SH.view==='depth'?'on':'';shImg()}
-function shImg(){if(!SH.cam)return;$('shimg').src=SH.view==='depth'?'/api/depth/'+SH.cam+'.jpg?t='+Date.now()
-  :'/api/shelf/'+SH.cam+'/still.jpg?t='+Date.now()}
+function shView(v){SH.view=v;shImg()}
+function shImg(){if(!SH.cam)return;const im=$('shimg');
+ if(!SH.calibrated&&SH.view==='still')SH.view='live';            // nothing to show still before calibrating
+ for(const [id,v] of [['b_vstill','still'],['b_vlive','live'],['b_depth','depth']])$(id).className=SH.view===v?'on':'';
+ if(SH.view==='live'){im.classList.add('live');im.dataset.cam=SH.cam;im._busy=false;return}
+ im.classList.remove('live');im.onload=null;im.onerror=shImgErr;
+ im.src=SH.view==='depth'?'/api/depth/'+SH.cam+'.jpg?t='+Date.now():'/api/shelf/'+SH.cam+'/still.jpg?t='+Date.now()}
 setInterval(()=>{if(TABV==='shelves'&&SH.view==='depth')shImg()},3000);
-function shImgErr(){if(SH.view!=='depth')return;SH.view='still';$('b_depth').className='';shImg();
+function shImgErr(){if(SH.view!=='depth')return;SH.view='live';shImg();
  const d=S&&S.depth&&S.depth[SH.cam];$('shmsg').textContent='No depth picture yet — '+(d&&!d.on?d.msg:'set a unit size on a product box and wait a few seconds')}
 function shDepthLine(){const el=$('shdepth');if(!el)return;const d=S&&S.depth&&S.depth[SH.cam];
  el.innerHTML=!d?'':d.on?`Depth model on — ${esc(d.msg)}${d.noise_cm!=null?` · fit error ${d.noise_cm} cm`:''}`
@@ -3354,7 +3447,7 @@ let CART=null,CARTV=null,LASTSCAN=0;
 async function coEnter(){await prodsLoad();
  if(S&&S.pos&&S.pos.active_cart&&!CART)CART=S.pos.active_cart;await cartRefresh();
  const till=Object.entries((S&&S.cams)||{}).find(([n,c])=>(c.roles||[]).includes('checkout'));
- $('tillcam').innerHTML=till?`<div class="feeds"><figure><img src="/video/${till[0]}" style="width:100%"><figcaption>${esc(till[0])}</figcaption></figure></div>
+ $('tillcam').innerHTML=till?`<div class="feeds"><figure><img class="live" data-cam="${esc(till[0])}" style="width:100%"><figcaption>${esc(till[0])}</figcaption></figure></div>
   <div id="scantoast"></div>`:`<div class="hint">No checkout camera. Add a camera with the <b>checkout</b> role, or use a USB barcode
   scanner — it types into the box on the left. Typing a product name works too.</div><div id="scantoast"></div>`;
  setTimeout(()=>$('scan').focus(),50)}
@@ -3413,9 +3506,10 @@ function coSync(s){const ls=s.pos&&s.pos.last_scan;if(!ls||ls.ts<=LASTSCAN)retur
 /* ---------- cctv ---------- */
 let CCTVV='cctv';
 function cctvMode(m){CCTVV=m;$('cv_plain').className='chip'+(m==='cctv'?' on':'');$('cv_ana').className='chip'+(m==='analytics'?' on':'');cctvBuild()}
-function cctvBuild(){const cams=Object.entries((S&&S.cams)||{});
+let CCTVSIG='';
+function cctvBuild(){const cams=Object.entries((S&&S.cams)||{});CCTVSIG=cams.map(([n])=>n).join('|');
  $('cctvgrid').innerHTML=cams.length?cams.map(([n,c])=>`<figure onclick="this.classList.toggle('big')">
-  <img src="/video/${esc(n)}?view=${CCTVV}" alt="${esc(n)}"><span class="badge" id="pb_${esc(n)}">${c.online?'● ':'○ '}${c.people||0} people</span>
+  <img class="live" data-cam="${esc(n)}" data-view="${CCTVV}" alt="${esc(n)}"><span class="badge" id="pb_${esc(n)}">${c.online?'● ':'○ '}${c.people||0} people</span>
   <figcaption>${esc((S.labels||{})[n]||n)} · ${c.roles.join(', ')} · ${c.fps} fps</figcaption></figure>`).join('')
   :'<div class="empty">No cameras running.</div>'}
 function cctvBadges(){for(const [n,c] of Object.entries(S.cams||{})){const b=$('pb_'+n);
@@ -3480,6 +3574,32 @@ async function report(p){const j=await(await fetch('/api/report?period='+p)).jso
   <a href="/api/report?period=${p}" target="_blank" style="color:var(--acc2)">Download JSON</a>`}
 loadLay().then(()=>tab(location.hash.slice(1)||'home'));
 </script></body></html>"""
+
+
+_PLACEHOLDERS = {}
+
+
+def placeholder_jpg(cam, msg):
+    """A dark card with the camera name and, in words, why there's no picture."""
+    key = (cam, msg)
+    if key not in _PLACEHOLDERS:
+        if len(_PLACEHOLDERS) > 200:
+            _PLACEHOLDERS.clear()
+        img = np.full((360, 640, 3), (25, 22, 20), np.uint8)
+        cv2.circle(img, (34, 40), 7, (79, 54, 232), -1)
+        cv2.putText(img, str(cam), (52, 47), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (235, 235, 235), 2, cv2.LINE_AA)
+        words, lines, cur = str(msg).split(), [], ""
+        for wd in words:
+            if len(cur) + len(wd) + 1 > 58:
+                lines.append(cur)
+                cur = wd
+            else:
+                cur = (cur + " " + wd).strip()
+        lines.append(cur)
+        for i, ln in enumerate(lines[:9]):
+            cv2.putText(img, ln, (26, 92 + i * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (170, 170, 175), 1, cv2.LINE_AA)
+        _PLACEHOLDERS[key] = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
+    return _PLACEHOLDERS[key]
 
 
 def check_roles(name, roles):
@@ -3623,21 +3743,36 @@ def make_app(engine, workers, store):
         engine.on_pos(data)
         return {"ok": True}
 
+    def latest_jpg(cam, view):
+        """Newest picture of a camera for the dashboard — or a card saying why there isn't one."""
+        w = workers.get(cam)                    # looked up every time: follows restarts from Setup
+        st = engine.cams.get(cam) or {}
+        if not w:
+            return placeholder_jpg(cam, "not running — give it a source in Setup and save the plan")
+        if not st.get("online"):
+            return placeholder_jpg(cam, st.get("msg") or "connecting…")
+        if view == "cctv":
+            w.cctv_want = time.time()           # keep the plain view rendered while someone watches
+            return w.cctv_jpg or w.jpg or placeholder_jpg(cam, "starting…")
+        return w.jpg or placeholder_jpg(cam, "starting…")
+
+    @app.get("/api/frame/{cam}.jpg")
+    def frame_jpg(cam: str, view: str = "analytics"):
+        """One frame. The dashboard asks for the next only when the last has arrived, so a slow link
+        drops frames instead of falling behind, and no connections are held open."""
+        return Response(latest_jpg(cam, view), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
     @app.get("/video/{cam}")
     def video(cam: str, view: str = "analytics"):
-        w = workers.get(cam)
-        if not w:
-            raise HTTPException(404)
-        cctv = view == "cctv"
-
+        """MJPEG stream, for VLC or other viewers outside the dashboard."""
         def gen():
+            last = None
             while True:
-                if cctv:
-                    w.cctv_want = time.time()   # keep the plain view being rendered while watched
-                frame = w.cctv_jpg if cctv else w.jpg
-                if frame:
-                    yield b"--f\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-                time.sleep(0.1)
+                f = latest_jpg(cam, view)
+                if f is not last:
+                    yield b"--f\r\nContent-Type: image/jpeg\r\n\r\n" + f + b"\r\n"
+                    last = f
+                time.sleep(0.05)
         return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=f")
 
     # ── shelves: the still to draw product boxes on, and the boxes themselves ──

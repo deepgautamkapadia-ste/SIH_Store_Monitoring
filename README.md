@@ -65,6 +65,8 @@ python storesense.py \
 
 or add them in **Setup**: select the camera, type its source, **Save plan** — it connects straight away, and the panel shows **● live** or, in plain words, why it isn't. A source can be a webcam index, a phone's address, an HTTP/RTSP stream or a video file. For a phone you can type just `192.168.1.24:8080` — `http://` and `/video` are added for you. Camera jobs: count people and watch queue (can share a camera), watch shelves, self-checkout.
 
+Phone streams are read with a latest-frame-only reader (old frames are dropped, never queued), frames are shrunk to 1280 px wide, and the dashboard asks for each new picture only after the last has arrived — so a slow link drops frames instead of lagging. For less load, set the phone app to 1280×720 and ~50% JPEG quality.
+
 If a phone won't connect: open its address in the laptop's browser first. If that doesn't load either, the network is the problem — campus and office Wi-Fi usually block devices from reaching each other, so put the phones and laptop on a phone hotspot instead.
 
 ## Setting up a store

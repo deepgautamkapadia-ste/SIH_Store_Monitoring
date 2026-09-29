@@ -211,7 +211,7 @@ check("depth picture served", r.status_code == 200 and r.headers["content-type"]
 r = cli.get("/api/slots/shelfD")
 check("unit size saved on the product box", r.json()["slots"][0]["unit_cm"] == 8.0, str(r.json()["slots"][0]))
 page = cli.get("/").text
-check("dashboard has depth controls", "Depth view" in page and "one unit, front to back" in page)
+check("dashboard has depth controls", "b_depth" in page and "one unit, front to back" in page)
 with open("depth_view_test.jpg", "wb") as fh:
     fh.write(cli.get("/api/depth/shelfD.jpg").content)
 
