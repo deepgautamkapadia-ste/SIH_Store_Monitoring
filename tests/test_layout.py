@@ -93,7 +93,7 @@ check("only shelf-role cameras count",
 # ── load / save / auto-binding ────────────────────────────────────────
 print("\nlayout file")
 lay = ss.Layout("lay.json")
-check("defaults when no file", lay.data["shelves"] == [] and lay.data["store"]["w"] == 12)
+check("defaults when no file", lay.data["shelves"] == [] and lay.data["store"]["w"] == 6)
 saved = lay.save({"store": {"w": 10, "h": 8},
                   "shelves": [shelf],
                   "cameras": [front, {**behind, "id": "c2"}]})
@@ -158,7 +158,9 @@ open("layout_3d.png", "wb").write(png)
 print("\napi")
 from fastapi.testclient import TestClient
 
-app = ss.make_app(eng, {}, store)
+# a worker with live mappings must survive a save (numpy attrs must not be truth-tested)
+worker = types.SimpleNamespace(storeH=np.eye(3), H=np.eye(3), _quad=[[0, 0]], _rect={"x": 1})
+app = ss.make_app(eng, {"entry": worker}, store)
 cl = TestClient(app)
 g = cl.get("/api/layout").json()
 check("GET returns layout + coverage", g["layout"]["store"]["w"] == 10 and "S1:N" in g["coverage"])
@@ -166,6 +168,7 @@ new = dict(g["layout"])
 new["store"] = {"w": 14, "h": 9}
 p = cl.post("/api/layout", json=new).json()
 check("POST saves", p["ok"] and p["layout"]["store"]["w"] == 14)
+check("worker mappings reset on save", worker.storeH is None and worker._rect is None)
 check("heat regridded on save", eng.store_heat.shape == (36, 56), str(eng.store_heat.shape))
 check("POST rejects junk", cl.post("/api/layout", json={"shelves": [{"x": 1}]}).json()["ok"] is False)
 check("3d endpoint serves PNG", cl.get("/api/layout/3d.png").content[:4] == b"\x89PNG")

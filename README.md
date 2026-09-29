@@ -1,34 +1,32 @@
 # StoreSense Edge
 
-On-device retail intelligence for Indian stores: footfall, shelf stock and billing queues from ordinary cameras, with no cloud dependency and no stored personal data.
+On-device retail intelligence for Indian stores. Ordinary cameras (old phones, CCTV, webcams) watch footfall, shelf stock, queues and the checkout — all on one edge box in the store, with no cloud dependency and no stored personal data.
 
 Built for **Smart India Hackathon 2026 — PS SIH26179** (AI-powered retail intelligence with edge AI).
 
-![Live dashboard](docs/dashboard.png)
+![Analytics](docs/analytics.png)
+
+## What's in it
+
+The dashboard has six tabs:
+
+| Tab | What you do there |
+|---|---|
+| **Home** | Live KPIs (inside now, entries, sales today, conversion, queue wait), alerts that say what to do, products running low, floor heatmap, footfall by hour |
+| **Shelves** | Draw a box around each product on the shelf picture, attach the product (SKU, barcode, brand, MRP, price), say how many sit side by side and how deep they stack. Live per-product stock table. Product catalog with printable barcode labels |
+| **Checkout** | Self-checkout / billing counter: scan with a USB barcode scanner, a checkout camera, or type a SKU or name. Cart with quantities, savings vs MRP, and a bill as PNG and PDF — "please move to the payment counter" |
+| **CCTV** | Every camera as a plain security view with people boxes and counts (faces blurred here too), or with analytics overlays |
+| **Analytics** | Footfall and bills per day, conversion, a weekday × hour busyness heatmap, footfall and revenue by hour, top products, stock-outs, basket sizes, queue waits — plus CSV exports for forecasting models |
+| **Setup** | Top-down store plan: drag shelves and cameras, see which shelf faces each camera covers and where the blind spots are; set a camera's entry line, queue area and floor points by clicking on its picture; orbitable 3D view |
 
 ## Why it's different
 
-- **Model your store, don't match a template.** Drag shelves and cameras onto a top-down plan in the dashboard. Shelves are rotatable rectangles of any size with up to four monitored faces; cameras have a position, heading, field of view and range, drawn as a dotted view cone. Nothing assumes a fixed camera arrangement.
-- **Coverage is derived, not configured.** Which shelf face each camera watches is computed from the geometry — field of view, range, which way the face points and whether another shelf blocks the line of sight. Faces go green when covered, red when they're a blind spot, so you see gaps before you mount anything.
-- **Grid mapping.** Everything is a grid. Each camera's floor patch maps its view into one shared store frame in metres, so several cameras at any angle build a single store-wide heatmap. Each shelf face is a grid of cells, and each cell is the planogram slot for one product.
-- **Facing cameras across an aisle still work** — each watching the *other* shelf head-on avoids steep angles and covers the aisle too — but that is now one layout among many, not a requirement.
-- **Occlusion-aware.** When a shopper blocks part of a shelf, those cells hold their last known state instead of reporting a false stock-out.
-- **Runs offline.** Inference, storage and dashboard all live on the edge box. Cloud sync is optional and buffers while the internet is down.
-- **Private by design.** Only anonymous track IDs and numbers are stored. No frames, no faces. Heads are blurred even on the live feed, and model telemetry is disabled.
-
-## Features
-
-| Module | What it does |
-|---|---|
-| Footfall | Entry/exit line counting, live occupancy, hourly trend (YOLO + ByteTrack) |
-| Store layout | Drag-and-drop top-down editor: shelves, cameras, view cones, live blind-spot warnings |
-| 3D view | Matplotlib 3D axes: floor heatmap, shelves coloured by live stock status, camera cones |
-| Floor grid | Store-wide heatmap in metres fed by every placed camera, plus per-zone visits and dwell time |
-| Shelf grid | Per-cell fill %, OK / LOW / EMPTY / MISPLACED, time-to-empty from the depletion trend |
-| Queue | Length, wait time, +5/+10/+15 min forecast, how many counters to open |
-| Decision engine | Rule-based priority alerts with cooldowns, dedupe and auto-resolve; staff "Done" tracks response time |
-| Reports | Daily and weekly footfall, peak hour, conversion, queue times, alerts |
-| Integration | POS hook `POST /api/integrations/pos`; offline cloud outbox for multi-store sync |
+- **Products, not grid cells.** You mark each product block on the shelf picture — a box can be as narrow as a single item, so taking one out registers. Each box is split into its facings (units side by side), and each knows its row and column on the shelf, so an alert reads *"Maggi Masala Noodles 70g — Aisle A, row 1 · col 1 low — about 12 of 24 left."*
+- **Honest stock counts.** One ordinary camera sees the front row of a shelf, not what's behind it. So the camera count is an **estimate** — facings still visible × how deep the storekeeper says they stack — and it's labelled as one. Where the till is used, stock is also tracked exactly: calibrating sets the level, each sale decrements it. Both numbers are shown side by side.
+- **Model your store, don't match a template.** Shelves and cameras go anywhere on the plan. Which shelf face a camera watches is computed from its position, lens angle, range and line of sight, so blind spots show up before you mount anything.
+- **Occlusion-aware.** When a shopper stands in front of a product, that box keeps its last reading instead of raising a false "empty".
+- **Checkout that works with what a shop has.** A basic USB barcode scanner, a phone pointed at the counter, or typing. Products without a barcode get an in-store EAN-13 from the GS1 20–29 range reserved for exactly this, with a printable label.
+- **Runs offline, private by design.** Detection, storage, billing and the dashboard all run on the edge box. Only anonymous track IDs and numbers are stored — no frames, no faces. Heads are blurred on every view, including CCTV, and model telemetry is disabled.
 
 ## Quick start
 
@@ -39,59 +37,72 @@ python storesense.py              # laptop webcam as entry + queue camera
 
 Open http://localhost:8000. The YOLO weights (~5 MB) download on the first run.
 
-### Demo without any cameras
+### Full demo, no cameras needed
 
 ```bash
-python storesense.py --config demo/demo_config.json \
-  --cam entry  entry,queue demo/walk.mp4 \
-  --cam shelfA shelf       demo/shelf.mp4
+python storesense.py --config demo/demo_config.json --demo-history 14
 ```
 
-This demo ships a store plan (`demo/demo_layout.json`): two aisle shelves, a rotated promo island, three cameras and a deliberate blind spot. Press **Calibrate** on the shelf card. Video files loop. The shelf video alternates between fully stocked and two empty cells, so you can watch alerts fire and auto-resolve.
+This runs the demo store plan (`demo/demo_layout.json`) with looping videos for the entry camera, a shelf camera with nine products marked on it, and a self-checkout camera that holds up three barcoded products. Open **Shelves** and press **Calibrate** once — the shelf video then alternates between full and two partly-emptied products, so you can watch them go LOW and recover.
+
+`--demo-history 14` fills the Analytics tab with 14 days of **generated** past trading so the charts have something to show. Every generated row is tagged in the database, the Analytics tab shows a banner while any are present, and real trading is added on top. Remove them with:
+
+```bash
+python storesense.py --config demo/demo_config.json --clear-demo
+```
 
 ### Real cameras (phones)
 
-Install **IP Webcam** (Android) on 2–3 phones, start the server in each app, and put the laptop on the same Wi-Fi or hotspot:
+Install **IP Webcam** (Android) on the phones, start its server, and put the laptop on the same Wi-Fi or hotspot. Then either pass cameras on the command line:
 
 ```bash
 python storesense.py \
   --cam entry  entry,queue  http://192.168.1.23:8080/video \
   --cam shelfA shelf        http://192.168.1.24:8080/video \
-  --cam shelfB shelf        http://192.168.1.25:8080/video
+  --cam till   checkout     http://192.168.1.25:8080/video
 ```
 
-A source can be a webcam index, an HTTP/RTSP stream or a video file.
+or add them in **Setup** with their `source` and just run `python storesense.py`. A source can be a webcam index, an HTTP/RTSP stream or a video file. Camera roles: `entry`, `queue` (these two can share a camera), `shelf`, `checkout`.
 
-## Setup
+## Setting up a store
 
-1. **Entry line, queue zone and floor corners.** Run `python storesense.py --pick SOURCE` and click points on a frame. It prints normalised coordinates to paste into `CONFIG["geometry"]` (entry line: 2 points; queue zone: 4+ points; floor quad: 4 points, TL TR BR BL).
-2. **Direction.** The entry feed draws an **IN** arrow. If it points the wrong way, flip `in_side`.
-3. **Shelves.** Set the face grid to match the real shelf (rows = physical shelves, columns = product facings) in the layout editor, or `shelf.grid` when running without a layout. Clear the aisle, stock the shelf fully, then press **Calibrate**.
-4. **The store plan.** In the dashboard, drag shelves and cameras onto the plan, set each camera's heading, field of view and range, and tick the faces to monitor. Green face = covered, red dashed = blind spot. Give each camera its `source` and **Save**; the layout is written to `layout.json`. Add a *floor patch* to any camera whose floor points you clicked with `--pick` — it is the real rectangle those four points correspond to, and it puts that camera's shoppers on the shared store heatmap.
+1. **Plan** (Setup tab): set the store size, drag in shelves and cameras, tick which shelf faces to monitor, give each camera its source, **Save plan**. Restart to start new cameras.
+2. **Point the cameras** (Setup tab, select a camera): click on its picture to place the **entry line** (flip the in/out direction with one button), the **queue area**, and four **floor points** that tie it into the store heatmap.
+3. **Calibrate shelves** (Shelves tab): fill the shelf, clear the aisle, press **Calibrate**.
+4. **Mark products** (Shelves tab): **Draw product box** around each product block, choose the product or create it, set facings and depth, **Save products**. Editing boxes later needs no re-calibration.
+5. **Products and labels** (Shelves tab, catalog): add products, print barcode labels for anything without one.
 
-With cameras defined in the layout you don't need `--cam` at all:
+All settings live in `CONFIG` at the top of `storesense.py`; a JSON file passed with `--config` is merged over it.
 
-```bash
-python storesense.py                     # runs every camera in layout.json that has a source
-```
+## Data for forecasting
 
-All settings live in `CONFIG` at the top of `storesense.py`. A JSON file passed with `--config` is merged over it.
+The Analytics tab links these downloads (also at `/api/export/{name}.csv`):
+
+| File | Rows | Use |
+|---|---|---|
+| `timeseries_hourly.csv` | one per hour: entries, exits, bills, revenue, items, average occupancy, average queue wait, stock alerts, weekday, `demo` flag | training table for a recurrent/sequence model of footfall and sales |
+| `timeseries_minute.csv` | one per minute while running (also written to `analytics/timeseries.csv`) | fine-grained live log |
+| `bills.csv` | one per bill | basket and revenue analysis |
+| `products.csv` | the catalog | |
+
+Filter on the `demo` column to keep generated history out of a model.
 
 ## Architecture
 
 ```
-store layout (metres) ─► coverage solver: which camera sees which shelf face
-             │
+store plan (metres) ─► coverage solver: which camera sees which shelf face
+        │
 cameras ─► capture threads (latest frame only)
-             ├─ PeopleWorker: YOLO + ByteTrack ─► line crossings, store-frame heatmap, queue zone
-             └─ ShelfWorker : person mask + per-cell compare vs reference ─► shelf grid
-                         │
-                         ▼
-               Engine (rule-based priority alerts, cooldown, dedupe, auto-resolve)
-                         │
-        SQLite (events, metrics, outbox) ─► optional cloud sync when online
-                         │
-               FastAPI ─► WebSocket dashboard, MJPEG feeds, REST, reports
+        ├─ PeopleWorker   : YOLO + ByteTrack ─► entry/exit line, store-frame heatmap, queue
+        ├─ ShelfWorker    : person mask + per-facing edge compare vs calibrated picture ─► product boxes
+        └─ CheckoutWorker : multi-scale barcode decoding ─► open cart
+                  │
+                  ▼
+   Engine: priority alerts (dedupe, auto-resolve) · carts & bills · stock levels
+                  │
+   SQLite (events, metrics, products, bills, outbox) · bills/ (PNG+PDF) · analytics/ (CSV)
+                  │
+   FastAPI ─► six-tab dashboard over WebSocket, MJPEG feeds, REST, CSV exports
 ```
 
 One Python file. It runs on any laptop for development. The deployment target is Qualcomm edge hardware: the Dragonwing RB3 Gen 2 (QCS6490) Vision Kit, or a Snapdragon phone for small stores. The detector is exported with `model.export(format="qnn")` to run on the Hexagon NPU.
@@ -99,35 +110,39 @@ One Python file. It runs on any laptop for development. The deployment target is
 ## Tests
 
 ```bash
-python tests/test_logic.py   # 49 checks: counting, queue, shelf, alerts, API, offline sync
-python tests/test_layout.py  # 48 checks: layout geometry, coverage, store mapping, 3D render
-python tests/test_real.py    # real YOLO on a generated walk-through video
+python tests/test_logic.py    # counting, queue, shelf grid, alerts, API, offline sync
+python tests/test_layout.py   # store plan geometry, coverage, store-frame mapping, 3D render
+python tests/test_pos.py      # catalog, carts, bills, checkout camera, product boxes, stock counts
+python tests/test_real.py     # real YOLO on a generated walk-through video
 ```
 
 ## Status
 
-**Working:** everything in the feature table, tested on synthetic video and with the real detector.
+**Working:** everything above, tested on generated video and with the real detector; barcode reading tested on generated labels under blur, rotation and noise.
 
-**Not yet validated:** shelf detection on real shelves (lighting, glare, shadows), floor homography on a real floor, and the queue forecast against real queues.
+**Not yet validated in a real store:** product-box detection under real shelf lighting, the floor mapping on a real floor, queue forecasts against real queues, and barcode reading on real packaging at a real counter.
 
-**Roadmap:**
-- Cross-check a shelf face from two cameras when the layout gives it double coverage.
-- A trained SKU model for true planogram checks (SKU-110K fine-tune).
-- An HQ dashboard for multiple stores.
-- Port to Qualcomm hardware (QNN export, Hexagon NPU) and benchmark on RB3 Gen 2 / Snapdragon.
+**Limits to be upfront about:** the camera stock count is an estimate (it cannot see behind the front row); the till count is exact only for products sold through this checkout.
+
+**Roadmap:** cross-checking a shelf face seen by two cameras; a trained SKU model for planogram checks (SKU-110K fine-tune); a multi-store HQ view; porting to Qualcomm hardware and benchmarking on RB3 Gen 2 / Snapdragon.
 
 ## API
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/` | Dashboard |
-| GET | `/api/state` | Full live state (JSON) |
-| GET | `/api/report?period=day\|week` | Report |
-| POST | `/api/alerts/{id}/ack` | Mark an alert done |
-| POST | `/api/counters?open=N` | Set open billing counters |
+| GET | `/api/state` · WS `/ws` | Full live state (pushed once a second) |
+| GET/POST | `/api/layout` | Store plan, with per-face coverage |
+| GET/POST | `/api/slots/{cam}` | Product boxes on a shelf camera |
+| GET | `/api/shelf/{cam}/still.jpg` | Calibrated shelf picture to mark products on |
 | POST | `/api/calibrate/{cam}` | Capture the shelf reference |
-| GET/POST | `/api/layout` | Read or save the store plan, with per-face coverage |
-| GET | `/api/layout/3d.png?az=&el=` | 3D render of the store |
-| POST | `/api/integrations/pos` | Record a POS bill |
-| GET | `/video/{cam}` | Annotated live feed (MJPEG) |
-| WS | `/ws` | Live state push, once per second |
+| GET/POST/DELETE | `/api/products` · `/api/products/{sku}` | Product catalog |
+| GET | `/api/products/{sku}/label.png` | Printable EAN-13 label |
+| POST | `/api/cart` · `/api/cart/{id}/scan` · `/set` · `/checkout` | Carts and billing |
+| GET | `/api/bills/{id}.png` · `.pdf` | Bill |
+| GET | `/api/analytics?days=` | Everything the Analytics tab draws |
+| GET | `/api/export/{name}.csv` | CSV exports |
+| GET | `/video/{cam}?view=cctv` | Live feed (plain CCTV or analytics overlay) |
+| POST | `/api/integrations/pos` | Record a sale from an external POS |
+| GET | `/api/report?period=day\|week` | Summary report |
+| POST | `/api/alerts/{id}/ack` · `/api/counters?open=N` | Staff actions |

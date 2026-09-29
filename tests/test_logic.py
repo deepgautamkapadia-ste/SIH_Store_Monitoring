@@ -191,7 +191,7 @@ sw.history[(1, 1)].clear()
 now = time.time()
 for i in range(10):
     sw.history[(1, 1)].append((now - (10 - i) * 60, 1.0 - 0.06 * i))
-eta = sw.eta(1, 1, now)
+eta = sw.eta((1, 1), now)
 check("ETA computed from trend", eta is not None and 0 < eta < 600, str(eta))
 
 # ── engine: priority, cooldown, ack ───────────────────────────────────

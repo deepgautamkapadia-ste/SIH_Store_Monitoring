@@ -17,3 +17,9 @@ tests/*.db
 layout.json
 layout.json.tmp
 tests/*.json
+
+# runtime output
+bills/
+analytics/
+tests/bills_test/
+tests/*.csv
