@@ -1,0 +1,20 @@
+{
+  "store": {"w": 10.0, "h": 7.0},
+  "shelves": [
+    {"id": "S1", "name": "Aisle 1 - A", "x": 4.0, "y": 2.0, "w": 4.0, "h": 0.6, "rot": 0,
+     "height": 1.8, "faces": {"S": {"grid": [4, 6]}}},
+    {"id": "S2", "name": "Aisle 1 - B", "x": 4.0, "y": 5.0, "w": 4.0, "h": 0.6, "rot": 0,
+     "height": 1.8, "faces": {"N": {"grid": [3, 5]}}},
+    {"id": "S3", "name": "Promo island", "x": 8.2, "y": 5.2, "w": 1.6, "h": 1.6, "rot": 30,
+     "height": 1.2, "faces": {"N": {"grid": [2, 3]}, "W": {"grid": [2, 3]}}}
+  ],
+  "cameras": [
+    {"id": "entry", "name": "Entry", "x": 0.6, "y": 3.5, "heading": 0, "fov": 80, "range": 9,
+     "height": 2.4, "roles": ["entry", "queue"], "source": "demo/walk.mp4",
+     "floor_rect": {"x": 3.0, "y": 3.5, "w": 5.0, "h": 3.0, "rot": 0}},
+    {"id": "shelfA", "name": "Aisle cam A", "x": 4.0, "y": 4.65, "heading": -90, "fov": 120,
+     "range": 6, "height": 1.9, "roles": ["shelf"], "source": "demo/shelf.mp4"},
+    {"id": "shelfB", "name": "Aisle cam B", "x": 4.0, "y": 2.35, "heading": 90, "fov": 120,
+     "range": 6, "height": 1.9, "roles": ["shelf"], "source": ""}
+  ]
+}

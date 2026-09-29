@@ -36,7 +36,7 @@ Setup
   Shelf cams: clear the aisle, fully stock the shelf, hit "Calibrate" on the dashboard.
   The entry feed draws an "IN" arrow — if it points the wrong way, flip "in_side" in CONFIG.
 """
-import argparse, json, os, sys, sqlite3, threading, time, urllib.request
+import argparse, json, math, os, sys, sqlite3, threading, time, urllib.request
 from collections import Counter, defaultdict, deque
 from datetime import datetime
 
@@ -86,6 +86,8 @@ CONFIG = {
         "target_wait_min": 3.0, "max_wait_min": 6.0,
         "min_time_in_zone_s": 4.0, "rate_window_min": 5.0,
     },
+    "layout_path": "layout.json",   # the store model: shelves and cameras in metres
+    "store_cell_m": 0.25,           # floor-heatmap resolution in the store frame
 }
 
 
@@ -111,6 +113,184 @@ def blur_heads(img, boxes):
         y2 = min(h, int(y1 + 0.25 * (y2 - y1)) + 1)
         if x2 - x1 > 2 and y2 - y1 > 2:
             img[y1:y2, x1:x2] = cv2.GaussianBlur(img[y1:y2, x1:x2], (31, 31), 0)
+
+
+# ─────────────────────────────── STORE LAYOUT ───────────────────────────────
+# The store is modelled top-down in metres. Shelves are rotatable rectangles with up
+# to four monitored faces (N/E/S/W in the shelf's own frame); cameras are points with
+# a heading, a field of view and a range. Nothing assumes cameras face each other:
+# which shelf face a camera actually watches is derived from the geometry, so any
+# arrangement works — one camera covering three shelves, or six around an island.
+
+FACES = ("N", "E", "S", "W")
+DEFAULT_LAYOUT = {"store": {"w": 12.0, "h": 8.0}, "shelves": [], "cameras": []}
+
+
+def rot_pt(px, py, cx, cy, deg):
+    a = math.radians(deg)
+    s, c = math.sin(a), math.cos(a)
+    dx, dy = px - cx, py - cy
+    return cx + dx * c - dy * s, cy + dx * s + dy * c
+
+
+def rect_corners(r):
+    """Corners of a centre-based rotated rect, clockwise from the local top-left."""
+    x, y, w, h, rot = r["x"], r["y"], r["w"], r["h"], r.get("rot", 0)
+    pts = [(x - w / 2, y - h / 2), (x + w / 2, y - h / 2), (x + w / 2, y + h / 2), (x - w / 2, y + h / 2)]
+    return [rot_pt(px, py, x, y, rot) for px, py in pts]
+
+
+def face_segment(shelf, face):
+    c = rect_corners(shelf)
+    return {"N": (c[0], c[1]), "E": (c[1], c[2]), "S": (c[2], c[3]), "W": (c[3], c[0])}[face]
+
+
+def face_normal(shelf, face):
+    n = {"N": (0, -1), "E": (1, 0), "S": (0, 1), "W": (-1, 0)}[face]
+    return rot_pt(n[0], n[1], 0, 0, shelf.get("rot", 0))
+
+
+def _ccw(a, b, c):
+    return (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0])
+
+
+def seg_cross(a, b, c, d):
+    return _ccw(a, c, d) != _ccw(b, c, d) and _ccw(a, b, c) != _ccw(a, b, d)
+
+
+def sight_blocked(p, q, shelves, skip_id):
+    """Does any other shelf stand between p and q?"""
+    for s in shelves:
+        if s.get("id") == skip_id:
+            continue
+        c = rect_corners(s)
+        for i in range(4):
+            if seg_cross(p, q, c[i], c[(i + 1) % 4]):
+                return True
+    return False
+
+
+def face_visibility(cam, shelf, face, shelves, samples=7):
+    """How much of a shelf face this camera really sees: 0..1 over FOV, range and occlusion."""
+    (x0, y0), (x1, y1) = face_segment(shelf, face)
+    cp = (cam["x"], cam["y"])
+    nx, ny = face_normal(shelf, face)
+    mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+    if (cp[0] - mx) * nx + (cp[1] - my) * ny <= 0:
+        return 0.0                                   # camera is behind this face
+    half = math.radians(cam.get("fov", 70)) / 2
+    rng = cam.get("range", 8.0)
+    head = math.radians(cam.get("heading", 0))
+    seen = 0
+    for i in range(samples):
+        t = (i + 0.5) / samples
+        p = (x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+        d = math.hypot(p[0] - cp[0], p[1] - cp[1])
+        if d > rng or d < 1e-6:
+            continue
+        ang = (math.atan2(p[1] - cp[1], p[0] - cp[0]) - head + math.pi) % (2 * math.pi) - math.pi
+        if abs(ang) > half:
+            continue
+        if sight_blocked(cp, p, shelves, shelf.get("id")):
+            continue
+        seen += 1
+    return seen / samples
+
+
+def coverage(layout):
+    """Best camera per shelf face, so the UI can show blind spots and workers can self-assign."""
+    shelves = layout.get("shelves", [])
+    cams = [c for c in layout.get("cameras", []) if "shelf" in c.get("roles", [])]
+    out = {}
+    for s in shelves:
+        for f in s.get("faces", {}):
+            best_v, best_c = 0.0, None
+            for cm in cams:
+                v = face_visibility(cm, s, f, shelves)
+                if v > best_v:
+                    best_v, best_c = v, cm.get("id")
+            out[f"{s['id']}:{f}"] = {"shelf": s["id"], "shelf_name": s.get("name", s["id"]), "face": f,
+                                     "visible": round(best_v, 2), "camera": best_c}
+    return out
+
+
+class Layout:
+    """The store model, loaded from / saved to a JSON file the editor writes."""
+
+    def __init__(self, path):
+        self.path, self.lock = path, threading.Lock()
+        self.data = dict(DEFAULT_LAYOUT)
+        if os.path.exists(path):
+            try:
+                with open(path) as fh:
+                    self.data = self.normalise(json.load(fh))
+            except Exception as e:
+                print(f"[layout] ignoring {path}: {e}")
+
+    @staticmethod
+    def normalise(d):
+        out = {"store": {"w": float(d.get("store", {}).get("w", 12)), "h": float(d.get("store", {}).get("h", 8))},
+               "shelves": [], "cameras": []}
+        for i, s in enumerate(d.get("shelves", [])):
+            sid = str(s.get("id") or f"S{i + 1}")
+            faces = s.get("faces") or {"N": {"grid": list(CONFIG["shelf"]["grid"])}}
+            out["shelves"].append({
+                "id": sid, "name": s.get("name", sid), "x": float(s["x"]), "y": float(s["y"]),
+                "w": float(s["w"]), "h": float(s["h"]), "rot": float(s.get("rot", 0)),
+                "height": float(s.get("height", 1.8)),
+                "faces": {f: {"grid": [int(v) for v in (faces[f] or {}).get("grid", CONFIG["shelf"]["grid"])]}
+                          for f in faces if f in FACES},
+            })
+        for i, c in enumerate(d.get("cameras", [])):
+            cid = str(c.get("id") or f"cam{i + 1}")
+            cam = {"id": cid, "name": c.get("name", cid), "x": float(c["x"]), "y": float(c["y"]),
+                   "heading": float(c.get("heading", 0)), "fov": float(c.get("fov", 70)),
+                   "range": float(c.get("range", 8)), "height": float(c.get("height", 2.2)),
+                   "roles": [r for r in c.get("roles", []) if r in ("entry", "queue", "shelf")] or ["shelf"],
+                   "source": c.get("source", "")}
+            if c.get("watch"):
+                cam["watch"] = {"shelf": c["watch"]["shelf"], "face": c["watch"]["face"]}
+            if c.get("floor_rect"):
+                fr = c["floor_rect"]
+                cam["floor_rect"] = {k: float(fr.get(k, 0)) for k in ("x", "y", "w", "h", "rot")}
+            out["cameras"].append(cam)
+        return out
+
+    def save(self, data):
+        with self.lock:
+            self.data = self.normalise(data)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(self.data, fh, indent=2)
+            os.replace(tmp, self.path)
+        return self.data
+
+    def cam(self, cam_id):
+        return next((c for c in self.data["cameras"] if c["id"] == cam_id), None)
+
+    def shelf(self, shelf_id):
+        return next((s for s in self.data["shelves"] if s["id"] == shelf_id), None)
+
+    def watched(self, cam_id):
+        """(shelf, face) this camera monitors: explicit if set, otherwise the face it sees best."""
+        c = self.cam(cam_id)
+        if not c:
+            return None, None
+        if c.get("watch"):
+            s = self.shelf(c["watch"]["shelf"])
+            if s and c["watch"]["face"] in s["faces"]:
+                return s, c["watch"]["face"]
+        best = (0.0, None, None)
+        for s in self.data["shelves"]:
+            for f in s["faces"]:
+                v = face_visibility(c, s, f, self.data["shelves"])
+                if v > best[0]:
+                    best = (v, s, f)
+        return (best[1], best[2]) if best[0] > 0 else (None, None)
+
+    def grid_dims(self):
+        m = max(CONFIG["store_cell_m"], 0.05)
+        return max(1, int(round(self.data["store"]["h"] / m))), max(1, int(round(self.data["store"]["w"] / m)))
 
 
 # ─────────────────────────────── CAPTURE ───────────────────────────────
@@ -239,12 +419,16 @@ class Store:
 class Engine:
     SEV = {1: "info", 2: "warning", 3: "critical"}
 
-    def __init__(self, store):
+    def __init__(self, store, layout=None):
         self.store, self.lock = store, threading.RLock()
+        self.layout = layout
+        # one floor heatmap for the whole store, in metres — every camera feeds the same grid
+        self.store_heat = np.zeros(layout.grid_dims(), np.float32) if layout else None
         self.footfall = {"in": 0, "out": 0}
         self.hourly, self.conversion, self.avg_response_s = {}, None, None
         self.alerts, self.last, self.keys, self.next_id = deque(maxlen=300), {}, {}, 1
         self.queues, self.shelves, self.heat, self.aisle, self.cams = {}, {}, {}, {}, {}
+        self.labels = {}              # camera -> human name from the layout ("Aisle 1 A, S face")
         self.zone_stats = defaultdict(lambda: defaultdict(lambda: [0, 0.0]))
         self.served = deque(maxlen=200)
         self.open_counters = CONFIG["queue"]["open_counters"]
@@ -347,10 +531,11 @@ class Engine:
         if not cells:
             return
         w = CONFIG["shelf"]["weights"].get(cam, 1.0)
+        where = self.labels.get(cam, cam)
         for c in cells:
             if c["occluded"]:
                 continue
-            key, loc = f"shelf:{cam}:{c['r']},{c['c']}", f"{cam} row {c['r'] + 1} col {c['c'] + 1}"
+            key, loc = f"shelf:{cam}:{c['r']},{c['c']}", f"{where} row {c['r'] + 1} col {c['c'] + 1}"
             if c["status"] == "EMPTY":
                 self.fire(key, "stock", 3, f"{loc} is empty", "Critical refill", w)
             elif c["status"] == "LOW":
@@ -404,7 +589,25 @@ class Engine:
                                 for z, s in zs.items()} for cam, zs in self.zone_stats.items()},
                 "avg_time_in_queue_min": round(float(np.mean(self.served)) / 60, 2) if self.served else None,
                 "cams": dict(self.cams), "alerts": alerts[:50],
+                "store_heat": self.store_heat_norm(), "layout": self.layout.data if self.layout else None,
             }
+
+    def store_heat_norm(self):
+        h = self.store_heat
+        if h is None:
+            return None
+        m = float(h.max())
+        return (h / m if m > 0 else h).round(3).tolist()
+
+    def add_store_heat(self, mx, my, dt):
+        """Drop dwell seconds onto the store-wide floor grid, in metres."""
+        h = self.store_heat
+        if h is None:
+            return
+        cell = max(CONFIG["store_cell_m"], 0.05)
+        r, c = int(my / cell), int(mx / cell)
+        if 0 <= r < h.shape[0] and 0 <= c < h.shape[1]:
+            h[r, c] += dt
 
 
 # ─────────────────────────────── CAMERA WORKERS ───────────────────────────────
@@ -459,6 +662,26 @@ class PeopleWorker(CamWorker):
         self.cand, self.members, self.missing = {}, {}, {}
         self.arrivals, self.departures = deque(), deque()
         self.mu_c = CONFIG["queue"]["default_service_per_min"]
+        self.storeH = None            # image -> store metres, built on the first frame
+
+    def store_point(self, fx, fy, w, h):
+        """Map a foot position to store metres, if this camera is placed in the layout.
+
+        The four floor points clicked with --pick correspond to the floor_rect the user
+        dragged onto the plan, which is what ties every camera into one shared frame.
+        """
+        lay = self.engine.layout
+        quad = self.g.get("floor_quad")
+        if lay is None or not quad:
+            return None
+        cam = lay.cam(self.name)
+        if not cam or not cam.get("floor_rect"):
+            return None
+        if self.storeH is None:
+            src = np.float32([[x * w, y * h] for x, y in quad][:4])
+            self.storeH = cv2.getPerspectiveTransform(src, np.float32(rect_corners(cam["floor_rect"])))
+        mx, my = cv2.perspectiveTransform(np.float32([[[fx, fy]]]), self.storeH)[0, 0]
+        return float(mx), float(my)
 
     def floor_cell(self, fx, fy, w, h):
         R, C = self.g["floor_grid"]
@@ -497,6 +720,9 @@ class PeopleWorker(CamWorker):
 
         for x1, y1, x2, y2, tid in dets:
             foot = ((x1 + x2) / 2, y2)
+            mp = self.store_point(foot[0], foot[1], w, h)
+            if mp:                              # every placed camera feeds the one store heatmap
+                self.engine.add_store_heat(mp[0], mp[1], dt)
             if "entry" in self.roles:
                 s = line_side(foot, a, b)
                 if s != 0:
@@ -612,7 +838,16 @@ class ShelfWorker(CamWorker):
         self.period = sc["period_s"]
         self.model = YOLO(CONFIG["person_model"])
         self.sku = YOLO(CONFIG["sku_model"]) if CONFIG["sku_model"] else None
+        # the layout decides which shelf face this camera watches and how it is divided
+        self.shelf_id = self.face = None
         self.R, self.C = sc["grid"]
+        if engine.layout:
+            sh, fc = engine.layout.watched(name)
+            if sh:
+                self.shelf_id, self.face = sh["id"], fc
+                self.R, self.C = sh["faces"][fc]["grid"]
+                engine.labels[name] = f"{sh['name']} ({fc} face)"
+                print(f"[{name}] watching {sh['name']} {fc} face, {self.R}x{self.C} cells")
         self.clahe = cv2.createCLAHE(2.0, (8, 8))
         self.ref_path = f"shelf_ref_{name}.png"
         self.ref = cv2.imread(self.ref_path) if os.path.exists(self.ref_path) else None
@@ -777,6 +1012,113 @@ def cloud_sync(engine, store):
             engine.online = False
 
 
+# ─────────────────────────────── 3D STORE VIEW ───────────────────────────────
+STATUS_RGB = {"OK": "#2fbf71", "LOW": "#f0b429", "EMPTY": "#ef4444", "MISPLACED": "#a78bfa", None: "#8b93a7"}
+
+
+def face_status(engine, shelf_id, face):
+    """Worst live status on a shelf face, so the 3D box is coloured by what staff must fix."""
+    lay = engine.layout
+    for cam, cells in engine.shelves.items():
+        if not cells:
+            continue
+        sh, fc = lay.watched(cam)
+        if not sh or sh["id"] != shelf_id or fc != face:
+            continue
+        for want in ("EMPTY", "LOW", "MISPLACED"):
+            if any(c["status"] == want for c in cells):
+                return want
+        return "OK"
+    return None
+
+
+def clip_to_store(p, q, W, H):
+    """Trim a sight ray at the store walls so view cones stay inside the plan (Liang-Barsky)."""
+    (x0, y0), (x1, y1) = p, q
+    dx, dy = x1 - x0, y1 - y0
+    t = 1.0
+    for num, den in ((x0, -dx), (W - x0, dx), (y0, -dy), (H - y0, dy)):
+        if abs(den) < 1e-9:
+            if num < 0:
+                return p
+            continue
+        if den > 0:
+            t = min(t, max(0.0, num / den))
+    return (x0 + dx * t, y0 + dy * t)
+
+
+def render_3d(engine, el=34, az=-62, dpi=110):
+    """Matplotlib 3D axes: floor heatmap, shelves as boxes, cameras with dotted view cones."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    lay = engine.layout
+    W, H = lay.data["store"]["w"], lay.data["store"]["h"]
+    fig = plt.figure(figsize=(9.5, 6.4), dpi=dpi)
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_facecolor("white")
+
+    # a filled floor polygon sorts in front of everything in mplot3d, so outline it instead
+    ax.plot([0, W, W, 0, 0], [0, 0, H, H, 0], [0] * 5, color="#8b97ab", lw=1.4)
+
+    heat = engine.store_heat
+    quads, colors = [], []
+    if heat is not None and float(heat.max()) > 0:
+        cell, mx = CONFIG["store_cell_m"], float(heat.max())
+        cmap = plt.get_cmap("inferno")
+        for r, c in zip(*np.nonzero(heat > mx * 0.02)):
+            x0, y0 = c * cell, r * cell
+            z = 0.004
+            quads.append([(x0, y0, z), (x0 + cell, y0, z), (x0 + cell, y0 + cell, z), (x0, y0 + cell, z)])
+            colors.append(cmap(float(heat[r, c] / mx)))
+    if quads:
+        ax.add_collection3d(Poly3DCollection(quads, facecolors=colors, edgecolors="none", zsort="min"))
+
+    for s in lay.data["shelves"]:
+        c = rect_corners(s)
+        z = s.get("height", 1.8)
+        top = [(p[0], p[1], z) for p in c]
+        bot = [(p[0], p[1], 0.0) for p in c]
+        sides, scolors = [top], ["#c9d2e0"]
+        for i, f in enumerate(("N", "E", "S", "W")):
+            a, b = c[i], c[(i + 1) % 4]
+            sides.append([(a[0], a[1], 0), (b[0], b[1], 0), (b[0], b[1], z), (a[0], a[1], z)])
+            scolors.append(STATUS_RGB[face_status(engine, s["id"], f)] if f in s["faces"] else "#dfe4ec")
+        ax.add_collection3d(Poly3DCollection(sides + [bot], facecolors=scolors + ["#c9d2e0"],
+                                             edgecolors="#31405a", linewidths=0.7))
+        cx, cy = s["x"], s["y"]
+        ax.text(cx, cy, z + 0.18, s["name"], ha="center", fontsize=7.5, color="#1a2a4a")
+
+    for cm in lay.data["cameras"]:
+        cx, cy, cz = cm["x"], cm["y"], cm.get("height", 2.2)
+        ax.scatter([cx], [cy], [cz], s=46, c="#1f6feb", marker="o", depthshade=False)
+        ax.plot([cx, cx], [cy, cy], [0, cz], color="#1f6feb", lw=0.8, alpha=0.5)
+        half, rng, head = math.radians(cm["fov"]) / 2, cm["range"], math.radians(cm["heading"])
+        arc = [clip_to_store((cx, cy), (cx + rng * math.cos(head + a), cy + rng * math.sin(head + a)), W, H)
+               for a in np.linspace(-half, half, 28)]
+        for p in (arc[0], arc[-1]):                       # the two edge rays, dotted
+            ax.plot([cx, p[0]], [cy, p[1]], [cz, 0], color="#1f6feb", ls=":", lw=1.1)
+        ax.plot([p[0] for p in arc], [p[1] for p in arc], [0] * len(arc), color="#1f6feb", ls=":", lw=1.1)
+        ax.text(cx, cy, cz + 0.25, cm["name"], ha="center", fontsize=7.5, color="#1f6feb")
+
+    ax.set_xlim(0, W)
+    ax.set_ylim(0, H)
+    ax.set_zlim(0, max(2.6, max([s.get("height", 1.8) for s in lay.data["shelves"]] + [2.2]) + 0.5))
+    ax.set_box_aspect((W, H, 2.4))
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_zlabel("Z (m)")
+    ax.view_init(elev=el, azim=az)
+    ax.set_title(f"{CONFIG['store_id']} — floor heatmap, shelf status and camera coverage", fontsize=11)
+    fig.tight_layout()
+    buf = __import__("io").BytesIO()
+    fig.savefig(buf, format="png", facecolor="white")
+    plt.close(fig)
+    return buf.getvalue()
+
+
 # ─────────────────────────────── API + DASHBOARD ───────────────────────────────
 DASHBOARD = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>StoreSense Edge</title><style>
@@ -807,6 +1149,15 @@ canvas{width:100%;border-radius:6px;image-rendering:pixelated;background:#0b0d12
 .bar b{position:absolute;top:-15px;left:0;right:0;text-align:center;font-size:10px;font-weight:500}
 .fc{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;text-align:center}.fc div{background:#1c2029;border-radius:8px;padding:8px}.fc small{color:var(--mute)}
 .muted{color:var(--mute)}pre{white-space:pre-wrap;margin:0}
+.lay{display:flex;gap:12px;flex-wrap:wrap}
+#plan{background:#0b0d12;border:1px solid var(--line);border-radius:8px;flex:1 1 420px;
+ width:100%;max-width:900px;height:auto;touch-action:none;cursor:crosshair}
+.panel{flex:0 0 250px;font-size:12.5px}
+.panel label{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:5px 0;color:var(--mute)}
+.panel input[type=number],.panel input[type=text]{width:92px}
+.panel input[type=checkbox]{width:auto}
+.panel h4{margin:2px 0 8px;font-size:13px;color:var(--text)}
+.panel .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 </style></head><body>
 <header><b>StoreSense Edge</b><span><span class="pill" id="store"></span> <span class="pill" id="conn">connecting…</span> <span class="pill" id="cloud"></span></span></header>
 <main>
@@ -817,6 +1168,20 @@ canvas{width:100%;border-radius:6px;image-rendering:pixelated;background:#0b0d12
 <section class="card s6"><h3>Floor heatmap &amp; zone dwell</h3><div id="heat"></div></section>
 <section class="card s6"><h3>Footfall today (per hour)</h3><div class="bars" id="hourly"></div><div id="aisle" style="margin-top:26px"></div></section>
 <section class="card s6"><h3>Reports <span><button onclick="report('day')">Daily</button> <button onclick="report('week')">Weekly</button></span></h3><div id="report" class="muted">Pick a period.</div></section>
+<section class="card s12"><h3>Store layout — drag shelves and cameras, top-down (metres)
+ <span><button onclick="addShelf()">+ Shelf</button> <button onclick="addCam()">+ Camera</button>
+ <button onclick="saveLay()">Save</button> <button onclick="loadLay()">Reload</button></span></h3>
+<div class="lay"><canvas id="plan" width="900" height="600"></canvas>
+<div class="panel" id="panel"></div></div>
+<div class="muted" id="blind" style="margin-top:8px"></div></section>
+<section class="card s12"><h3>3D view
+ <span><button onclick="spin(-30)">&#8630; rotate</button> <button onclick="spin(30)">rotate &#8631;</button>
+ <button onclick="tilt(10)">tilt up</button> <button onclick="tilt(-10)">tilt down</button>
+ <button onclick="shot3d()">Refresh</button></span></h3>
+<img id="v3d" style="max-width:100%;border-radius:8px;border:1px solid var(--line)">
+<div class="muted" style="margin-top:6px">Shelf faces are coloured by live stock status (green OK, amber low,
+ red empty, violet misplaced); grey faces are not monitored. Dotted cones are camera coverage, clipped at the
+ walls. Rotate to bring a face into view.</div></section>
 <section class="card s12"><h3>Live cameras (heads blurred, nothing recorded)</h3><div class="feeds" id="feeds"></div></section>
 </main>
 <script>
@@ -860,8 +1225,172 @@ function render(s){
  const hrs=Object.entries(s.hourly),mx=Math.max(1,...hrs.map(h=>h[1]));
  $('hourly').innerHTML=hrs.length?hrs.map(([h,v])=>`<div class="bar" style="height:${100*v/mx}%"><b>${v}</b><i>${h}</i></div>`).join(''):'<div class="muted">No entries yet today.</div>';
  $('aisle').innerHTML=Object.entries(s.aisle).map(([cam,a])=>`<div class="muted">${cam} aisle: ${a.people} shopper(s) now · ${a.person_minutes} shopper-minutes today</div>`).join('');
+ if(s.store_heat){HEAT=s.store_heat;if(!DRAG)draw()}
  if(!feedsBuilt&&Object.keys(s.cams).length){feedsBuilt=true;$('feeds').innerHTML=Object.entries(s.cams).map(([n,c])=>`<figure><img src="/video/${n}"><figcaption>${n} · ${c.roles.join(', ')}</figcaption></figure>`).join('')}
 }
+/* ---------- store layout editor: top-down, metres, drag and drop ---------- */
+let LAY={store:{w:12,h:8},shelves:[],cameras:[]},SEL=null,DRAG=null,HEAT=null,SC=60;
+const CV=$('plan'),CX=CV.getContext('2d'),SNAP=0.25,FACES=['N','E','S','W'];
+const m2p=v=>v*SC, p2m=v=>v/SC;
+function rot(px,py,cx,cy,d){const a=d*Math.PI/180,s=Math.sin(a),c=Math.cos(a),dx=px-cx,dy=py-cy;
+ return [cx+dx*c-dy*s, cy+dx*s+dy*c]}
+function corners(r){const {x,y,w,h}=r,d=r.rot||0;
+ return [[x-w/2,y-h/2],[x+w/2,y-h/2],[x+w/2,y+h/2],[x-w/2,y+h/2]].map(p=>rot(p[0],p[1],x,y,d))}
+function faceSeg(s,f){const c=corners(s);return {N:[c[0],c[1]],E:[c[1],c[2]],S:[c[2],c[3]],W:[c[3],c[0]]}[f]}
+function faceNorm(s,f){const n={N:[0,-1],E:[1,0],S:[0,1],W:[-1,0]}[f];return rot(n[0],n[1],0,0,s.rot||0)}
+const ccw=(a,b,c)=>(c[1]-a[1])*(b[0]-a[0])>(b[1]-a[1])*(c[0]-a[0]);
+const cross=(a,b,c,d)=>ccw(a,c,d)!==ccw(b,c,d)&&ccw(a,b,c)!==ccw(a,b,d);
+function blockedBy(p,q,skip){for(const s of LAY.shelves){if(s.id===skip)continue;const c=corners(s);
+ for(let i=0;i<4;i++)if(cross(p,q,c[i],c[(i+1)%4]))return true}return false}
+function vis(cam,s,f){const [a,b]=faceSeg(s,f),n=faceNorm(s,f),mx=(a[0]+b[0])/2,my=(a[1]+b[1])/2;
+ if((cam.x-mx)*n[0]+(cam.y-my)*n[1]<=0)return 0;
+ const half=cam.fov*Math.PI/360,head=cam.heading*Math.PI/180;let seen=0,N=7;
+ for(let i=0;i<N;i++){const t=(i+0.5)/N,p=[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t];
+  const d=Math.hypot(p[0]-cam.x,p[1]-cam.y);if(d>cam.range||d<1e-6)continue;
+  let ang=Math.atan2(p[1]-cam.y,p[0]-cam.x)-head;ang=(ang+Math.PI)%(2*Math.PI)-Math.PI;
+  if(Math.abs(ang)>half)continue;if(blockedBy([cam.x,cam.y],p,s.id))continue;seen++}
+ return seen/N}
+function bestVis(s,f){let v=0;for(const c of LAY.cameras)if((c.roles||[]).includes('shelf'))v=Math.max(v,vis(c,s,f));return v}
+/* fixed internal resolution (CSS scales it): measuring the element instead would let the
+   canvas grow to fill its flex line each frame and push the property panel onto a new row */
+function fit(){const IW=1200;if(CV.width!==IW)CV.width=IW;
+ SC=IW/LAY.store.w;CV.height=Math.max(200,Math.round(m2p(LAY.store.h)))}
+function draw(){fit();const W=CV.width,H=CV.height;CX.clearRect(0,0,W,H);
+ CX.fillStyle='#0b0d12';CX.fillRect(0,0,W,H);
+ if(HEAT&&HEAT.length){const rows=HEAT.length,cols=HEAT[0].length,cw=W/cols,ch=H/rows;
+  for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){const v=HEAT[r][c];if(v>0.02){
+   CX.fillStyle=`rgba(${Math.round(255*Math.min(1,v*2))},${Math.round(200*Math.max(0,1-v))},40,${0.15+0.55*v})`;
+   CX.fillRect(c*cw,r*ch,cw+0.5,ch+0.5)}}}
+ CX.lineWidth=1;
+ for(let x=0;x<=LAY.store.w+1e-6;x+=0.5){CX.strokeStyle=(Math.abs(x%1)<1e-6)?'#232838':'#171a21';
+  CX.beginPath();CX.moveTo(m2p(x),0);CX.lineTo(m2p(x),H);CX.stroke()}
+ for(let y=0;y<=LAY.store.h+1e-6;y+=0.5){CX.strokeStyle=(Math.abs(y%1)<1e-6)?'#232838':'#171a21';
+  CX.beginPath();CX.moveTo(0,m2p(y));CX.lineTo(W,m2p(y));CX.stroke()}
+ CX.strokeStyle='#45506a';CX.lineWidth=2;CX.strokeRect(1,1,W-2,H-2);
+ for(const cm of LAY.cameras){if(cm.floor_rect){const c=corners(cm.floor_rect).map(p=>[m2p(p[0]),m2p(p[1])]);
+  CX.setLineDash([5,4]);CX.strokeStyle='#4f8cff';CX.fillStyle='rgba(79,140,255,.07)';
+  CX.beginPath();c.forEach((p,i)=>i?CX.lineTo(p[0],p[1]):CX.moveTo(p[0],p[1]));CX.closePath();CX.fill();CX.stroke();
+  CX.setLineDash([]);CX.fillStyle='#4f8cff';CX.font='10px system-ui';CX.fillText('floor patch: '+cm.name,c[0][0]+4,c[0][1]+12)}}
+ for(const s of LAY.shelves){const c=corners(s).map(p=>[m2p(p[0]),m2p(p[1])]);
+  CX.fillStyle=(SEL&&SEL.t==='s'&&SEL.id===s.id)?'#2b3b2f':'#1e2733';
+  CX.beginPath();c.forEach((p,i)=>i?CX.lineTo(p[0],p[1]):CX.moveTo(p[0],p[1]));CX.closePath();CX.fill();
+  CX.strokeStyle='#3a4658';CX.lineWidth=1;CX.stroke();
+  FACES.forEach((f,i)=>{if(!s.faces[f])return;const a=c[i],b=c[(i+1)%4],v=bestVis(s,f);
+   CX.lineWidth=4;CX.setLineDash(v>0?[]:[6,4]);
+   CX.strokeStyle=v>=0.6?'#2fbf71':(v>0?'#f0b429':'#ef4444');
+   CX.beginPath();CX.moveTo(a[0],a[1]);CX.lineTo(b[0],b[1]);CX.stroke();CX.setLineDash([])});
+  CX.fillStyle='#e6e8ee';CX.font='11px system-ui';CX.textAlign='center';
+  CX.fillText(s.name,m2p(s.x),m2p(s.y)+4);CX.textAlign='left'}
+ for(const cm of LAY.cameras){const x=m2p(cm.x),y=m2p(cm.y),half=cm.fov*Math.PI/360,hd=cm.heading*Math.PI/180;
+  CX.setLineDash([4,4]);CX.strokeStyle='#4f8cff';CX.fillStyle='rgba(79,140,255,.10)';CX.lineWidth=1.2;
+  CX.beginPath();CX.moveTo(x,y);CX.arc(x,y,m2p(cm.range),hd-half,hd+half);CX.closePath();CX.fill();CX.stroke();
+  CX.setLineDash([]);CX.fillStyle=(SEL&&SEL.t==='c'&&SEL.id===cm.id)?'#fff':'#4f8cff';
+  CX.beginPath();CX.arc(x,y,7,0,6.3);CX.fill();
+  CX.fillStyle='#9ab6ff';CX.font='11px system-ui';CX.fillText(cm.name,x+10,y-8)}
+ const o=selObj();if(o){const p=handles(o);CX.fillStyle='#ffd166';
+  for(const k in p){CX.beginPath();CX.arc(m2p(p[k][0]),m2p(p[k][1]),5,0,6.3);CX.fill()}}}
+function selObj(){if(!SEL)return null;
+ if(SEL.t==='s')return LAY.shelves.find(s=>s.id===SEL.id);
+ if(SEL.t==='c')return LAY.cameras.find(c=>c.id===SEL.id);
+ const cm=LAY.cameras.find(c=>c.id===SEL.id);return cm&&cm.floor_rect}
+function handles(o){if(SEL.t==='c')return {head:[o.x+Math.cos(o.heading*Math.PI/180)*o.range*0.55,
+  o.y+Math.sin(o.heading*Math.PI/180)*o.range*0.55]};
+ const c=corners(o);return {rot:rot(o.x,o.y-o.h/2-0.45,o.x,o.y,o.rot||0),size:c[2]}}
+function hit(mx,my){const o=selObj();
+ if(o){const p=handles(o);for(const k in p)if(Math.hypot(mx-p[k][0],my-p[k][1])<p2m(11))return {t:SEL.t,id:SEL.id,mode:k}}
+ for(const cm of LAY.cameras)if(Math.hypot(mx-cm.x,my-cm.y)<p2m(12))return {t:'c',id:cm.id,mode:'move'};
+ for(let i=LAY.shelves.length-1;i>=0;i--){const s=LAY.shelves[i];const l=rot(mx,my,s.x,s.y,-(s.rot||0));
+  if(Math.abs(l[0]-s.x)<=s.w/2&&Math.abs(l[1]-s.y)<=s.h/2)return {t:'s',id:s.id,mode:'move'}}
+ for(const cm of LAY.cameras){if(!cm.floor_rect)continue;const f=cm.floor_rect;
+  const l=rot(mx,my,f.x,f.y,-(f.rot||0));
+  if(Math.abs(l[0]-f.x)<=f.w/2&&Math.abs(l[1]-f.y)<=f.h/2)return {t:'f',id:cm.id,mode:'move'}}
+ return null}
+function evM(e){const r=CV.getBoundingClientRect();
+ return [p2m((e.clientX-r.left)*CV.width/r.width),p2m((e.clientY-r.top)*CV.height/r.height)]}
+CV.addEventListener('pointerdown',e=>{const [mx,my]=evM(e);const h=hit(mx,my);
+ if(!h){SEL=null;panel();draw();return}
+ if(SEL===null||SEL.t!==h.t||SEL.id!==h.id){SEL={t:h.t,id:h.id};panel()}
+ const o=selObj();DRAG={mode:h.mode,ox:mx-(o.x||0),oy:my-(o.y||0)};CV.setPointerCapture(e.pointerId);draw()});
+CV.addEventListener('pointermove',e=>{if(!DRAG)return;const [mx,my]=evM(e);const o=selObj();if(!o)return;
+ const sn=v=>e.shiftKey?v:Math.round(v/SNAP)*SNAP;
+ if(DRAG.mode==='move'){o.x=sn(mx-DRAG.ox);o.y=sn(my-DRAG.oy)}
+ else if(DRAG.mode==='head'){o.heading=Math.round(Math.atan2(my-o.y,mx-o.x)*180/Math.PI/5)*5}
+ else if(DRAG.mode==='rot'){o.rot=Math.round((Math.atan2(my-o.y,mx-o.x)*180/Math.PI+90)/5)*5}
+ else if(DRAG.mode==='size'){const l=rot(mx,my,o.x,o.y,-(o.rot||0));
+  o.w=Math.max(0.2,sn(Math.abs(l[0]-o.x)*2));o.h=Math.max(0.2,sn(Math.abs(l[1]-o.y)*2))}
+ panel();draw()});
+addEventListener('pointerup',()=>{DRAG=null});
+addEventListener('keydown',e=>{if(e.key!=='Delete'||!SEL||/INPUT/.test(document.activeElement.tagName))return;
+ if(SEL.t==='s')LAY.shelves=LAY.shelves.filter(s=>s.id!==SEL.id);
+ else if(SEL.t==='c')LAY.cameras=LAY.cameras.filter(c=>c.id!==SEL.id);
+ else {const cm=LAY.cameras.find(c=>c.id===SEL.id);delete cm.floor_rect}
+ SEL=null;panel();draw()});
+function fld(l,v,on,st){return `<label>${l}<input type="number" step="${st||0.1}" value="${v}" oninput="${on}"></label>`}
+function panel(){const o=selObj();let h=`<h4>Store</h4>
+ ${fld('width (m)',LAY.store.w,'LAY.store.w=+this.value;draw()',0.5)}
+ ${fld('depth (m)',LAY.store.h,'LAY.store.h=+this.value;draw()',0.5)}`;
+ if(!o){h+='<p class="muted">Click a shelf or camera to edit it. Drag to move, yellow handles rotate and resize, Delete removes.</p>'}
+ else if(SEL.t==='s'){h+=`<h4>Shelf</h4>
+  <label>name<input type="text" value="${o.name}" oninput="selObj().name=this.value;draw()"></label>
+  ${fld('x (m)',o.x,'selObj().x=+this.value;draw()')}${fld('y (m)',o.y,'selObj().y=+this.value;draw()')}
+  ${fld('width (m)',o.w,'selObj().w=+this.value;draw()')}${fld('depth (m)',o.h,'selObj().h=+this.value;draw()')}
+  ${fld('height (m)',o.height,'selObj().height=+this.value;draw()')}
+  ${fld('rotation (deg)',o.rot||0,'selObj().rot=+this.value;draw()',5)}
+  <h4>Monitored faces</h4>`;
+  FACES.forEach(f=>{const on=!!o.faces[f],g=on?o.faces[f].grid:[4,6];
+   h+=`<div class="row"><label style="flex:1"><span>${f} face</span>
+    <input type="checkbox" ${on?'checked':''} onchange="tglFace('${f}',this.checked)"></label>`;
+   if(on)h+=`<input type="number" min="1" value="${g[0]}" style="width:52px" title="rows"
+     oninput="selObj().faces['${f}'].grid[0]=+this.value">
+    <input type="number" min="1" value="${g[1]}" style="width:52px" title="cols"
+     oninput="selObj().faces['${f}'].grid[1]=+this.value">`;
+   h+=`</div>`;
+   if(on)h+=`<div class="muted" style="margin:-2px 0 6px">seen ${Math.round(bestVis(o,f)*100)}% &middot; rows x cols</div>`})}
+ else if(SEL.t==='c'){h+=`<h4>Camera</h4>
+  <label>name<input type="text" value="${o.name}" oninput="selObj().name=this.value;draw()"></label>
+  <label>source<input type="text" value="${o.source||''}" oninput="selObj().source=this.value"
+   title="webcam index, http://phone:8080/video, rtsp:// or a file"></label>
+  ${fld('x (m)',o.x,'selObj().x=+this.value;draw()')}${fld('y (m)',o.y,'selObj().y=+this.value;draw()')}
+  ${fld('heading (deg)',o.heading,'selObj().heading=+this.value;draw()',5)}
+  ${fld('field of view (deg)',o.fov,'selObj().fov=+this.value;draw()',5)}
+  ${fld('range (m)',o.range,'selObj().range=+this.value;draw()',0.5)}
+  ${fld('mount height (m)',o.height||2.2,'selObj().height=+this.value')}
+  <div class="row">`+['entry','queue','shelf'].map(r=>`<label style="flex:none">${r}
+   <input type="checkbox" ${(o.roles||[]).includes(r)?'checked':''} onchange="tglRole('${r}',this.checked)"></label>`).join('')+
+  `</div><button onclick="tglPatch()">${o.floor_rect?'remove':'add'} floor patch</button>
+  <div class="muted" style="margin-top:6px">The floor patch is the real-world rectangle matching the 4 floor
+  points you clicked with --pick. It puts this camera's shoppers on the shared store heatmap.</div>`}
+ else {h+=`<h4>Floor patch</h4>${fld('x (m)',o.x,'selObj().x=+this.value;draw()')}
+  ${fld('y (m)',o.y,'selObj().y=+this.value;draw()')}${fld('width (m)',o.w,'selObj().w=+this.value;draw()')}
+  ${fld('depth (m)',o.h,'selObj().h=+this.value;draw()')}${fld('rotation (deg)',o.rot||0,'selObj().rot=+this.value;draw()',5)}`}
+ $('panel').innerHTML=h;blind()}
+function tglFace(f,on){const s=selObj();if(on)s.faces[f]={grid:[4,6]};else delete s.faces[f];panel();draw()}
+function tglRole(r,on){const c=selObj();c.roles=c.roles||[];
+ c.roles=on?[...new Set([...c.roles,r])]:c.roles.filter(x=>x!==r);panel();draw()}
+function tglPatch(){const c=selObj();
+ if(c.floor_rect)delete c.floor_rect;else c.floor_rect={x:c.x+2,y:c.y,w:3,h:2,rot:0};panel();draw()}
+function blind(){const bad=[];for(const s of LAY.shelves)for(const f in s.faces)
+ if(bestVis(s,f)<0.6)bad.push(`${s.name} ${f}${bestVis(s,f)>0?' (partial)':''}`);
+ $('blind').innerHTML=bad.length?'⚠ not fully covered: '+bad.join(', ')
+  :(LAY.shelves.length?'✓ every monitored shelf face is covered by a camera':'Add shelves and cameras to model the store.')}
+function addShelf(){const n=LAY.shelves.length+1;
+ LAY.shelves.push({id:'S'+Date.now().toString(36),name:'Shelf '+n,x:LAY.store.w/2,y:LAY.store.h/2,
+  w:3,h:0.6,rot:0,height:1.8,faces:{N:{grid:[4,6]},S:{grid:[4,6]}}});
+ SEL={t:'s',id:LAY.shelves[LAY.shelves.length-1].id};panel();draw()}
+function addCam(){const n=LAY.cameras.length+1;
+ LAY.cameras.push({id:'cam'+Date.now().toString(36),name:'Camera '+n,x:1,y:LAY.store.h/2,heading:0,
+  fov:70,range:8,height:2.2,roles:['shelf'],source:''});
+ SEL={t:'c',id:LAY.cameras[LAY.cameras.length-1].id};panel();draw()}
+async function loadLay(){const j=await(await fetch('/api/layout')).json();LAY=j.layout;SEL=null;panel();draw()}
+async function saveLay(){const r=await fetch('/api/layout',{method:'POST',headers:{'Content-Type':'application/json'},
+ body:JSON.stringify(LAY)});const j=await r.json();
+ if(j.ok){LAY=j.layout;panel();draw();shot3d();
+  $('blind').innerHTML+=' &middot; saved. Restart to apply new camera sources.'}else alert(j.error||'save failed')}
+let AZ=-62,EL=34;
+function shot3d(){$('v3d').src=`/api/layout/3d.png?az=${AZ}&el=${EL}&t=${Date.now()}`}
+function spin(d){AZ=(AZ+d)%360;shot3d()}
+function tilt(d){EL=Math.max(5,Math.min(85,EL+d));shot3d()}
+loadLay().then(shot3d);
 async function ack(id){await fetch('/api/alerts/'+id+'/ack',{method:'POST'})}
 async function calib(cam){const r=await fetch('/api/calibrate/'+cam,{method:'POST'});const j=await r.json();alert(j.message)}
 async function setCounters(){await fetch('/api/counters?open='+$('ctr').value,{method:'POST'})}
@@ -880,7 +1409,7 @@ async function report(p){const j=await(await fetch('/api/report?period='+p)).jso
 def make_app(engine, workers, store):
     import asyncio
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
-    from fastapi.responses import HTMLResponse, StreamingResponse
+    from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
     app = FastAPI(title="StoreSense Edge")
 
@@ -916,6 +1445,33 @@ def make_app(engine, workers, store):
                 break
             time.sleep(0.2)
         return {"message": w.calib_msg or "Camera not responding"}
+
+    @app.get("/api/layout")
+    def get_layout():
+        lay = engine.layout
+        return {"layout": lay.data if lay else DEFAULT_LAYOUT,
+                "coverage": coverage(lay.data) if lay else {}}
+
+    @app.post("/api/layout")
+    async def post_layout(req: Request):
+        lay = engine.layout
+        if not lay:
+            raise HTTPException(400, "no layout file configured")
+        try:
+            data = lay.save(await req.json())
+        except (KeyError, TypeError, ValueError) as e:
+            return {"ok": False, "error": f"bad layout: {e}"}
+        with engine.lock:                       # store size may have changed -> regrid the heatmap
+            engine.store_heat = np.zeros(lay.grid_dims(), np.float32)
+        for w in workers.values():              # cameras may have moved -> rebuild their mappings
+            w.storeH = getattr(w, "storeH", None) and None
+        return {"ok": True, "layout": data, "coverage": coverage(data)}
+
+    @app.get("/api/layout/3d.png")
+    def layout_3d(el: float = 34, az: float = -62):
+        if not engine.layout:
+            raise HTTPException(404, "no layout")
+        return Response(render_3d(engine, el, az), media_type="image/png")
 
     @app.post("/api/integrations/pos")
     async def pos(req: Request):
@@ -1004,6 +1560,7 @@ def main():
     ap.add_argument("--config", help="optional JSON merged over CONFIG")
     ap.add_argument("--sku-model", help="optional YOLO SKU weights for planogram checks")
     ap.add_argument("--cloud-url")
+    ap.add_argument("--layout", help="store layout JSON written by the dashboard editor")
     ap.add_argument("--pick", metavar="SOURCE", help="click points on a frame to get geometry coords")
     args = ap.parse_args()
 
@@ -1014,6 +1571,8 @@ def main():
         CONFIG["sku_model"] = args.sku_model
     if args.cloud_url:
         CONFIG["cloud_url"] = args.cloud_url
+    if args.layout:
+        CONFIG["layout_path"] = args.layout
     if args.pick:
         return pick(args.pick)
 
@@ -1024,9 +1583,16 @@ def main():
         pass
 
     store = Store(CONFIG["db_path"])
-    engine = Engine(store)
+    layout = Layout(CONFIG["layout_path"])
+    engine = Engine(store, layout)
     workers = {}
-    for name, roles, src in args.cam or [["cam0", "entry,queue", "0"]]:
+    # with no --cam, run whatever the layout says: model the store in the editor, then just start
+    cams = args.cam or [[c["id"], ",".join(c["roles"]), c["source"]]
+                        for c in layout.data["cameras"] if c.get("source")]
+    if not cams:
+        cams = [["cam0", "entry,queue", "0"]]
+        print("no --cam and no camera sources in the layout: using the laptop webcam")
+    for name, roles, src in cams:
         roles = {r.strip() for r in roles.split(",") if r.strip()}
         if not roles <= {"entry", "queue", "shelf"}:
             sys.exit(f"Unknown role in {roles}")

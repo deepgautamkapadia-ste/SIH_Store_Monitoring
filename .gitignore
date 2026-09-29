@@ -12,3 +12,8 @@ tests/*.mp4
 tests/*.jpg
 tests/*.png
 tests/*.db
+
+# the store plan is per-installation runtime state
+layout.json
+layout.json.tmp
+tests/*.json
