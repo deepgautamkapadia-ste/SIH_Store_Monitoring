@@ -147,7 +147,15 @@ def blur_heads(img, boxes):
 
 FACES = ("N", "E", "S", "W")
 # a small shop is the common case, so that is the default canvas — not a warehouse
-DEFAULT_LAYOUT = {"store": {"w": 6.0, "h": 4.0}, "shelves": [], "cameras": []}
+DEFAULT_LAYOUT = {"store": {"w": 6.0, "h": 4.0}, "shelves": [], "cameras": [], "fixtures": []}
+# things on the plan that aren't shelves: doors (entry / exit), checkout counters, anything else
+# (pillar, freezer, promo stand). Counters and fixtures block camera views; doors don't.
+FIXTURE_KINDS = {"door": 2.1, "counter": 1.0, "fixture": 1.5}      # kind -> default height (m)
+
+
+def blockers(layout):
+    """Everything a camera can't see through: shelves, counters, other fixtures (not doors)."""
+    return list(layout.get("shelves", [])) + [f for f in layout.get("fixtures", []) if f.get("kind") != "door"]
 
 
 def rot_pt(px, py, cx, cy, deg):
@@ -224,13 +232,14 @@ def face_visibility(cam, shelf, face, shelves, samples=7):
 def coverage(layout):
     """Best camera per shelf face, so the UI can show blind spots and workers can self-assign."""
     shelves = layout.get("shelves", [])
+    walls = blockers(layout)
     cams = [c for c in layout.get("cameras", []) if "shelf" in c.get("roles", [])]
     out = {}
     for s in shelves:
         for f in s.get("faces", {}):
             best_v, best_c = 0.0, None
             for cm in cams:
-                v = face_visibility(cm, s, f, shelves)
+                v = face_visibility(cm, s, f, walls)
                 if v > best_v:
                     best_v, best_c = v, cm.get("id")
             out[f"{s['id']}:{f}"] = {"shelf": s["id"], "shelf_name": s.get("name", s["id"]), "face": f,
@@ -275,7 +284,15 @@ class Layout:
     def normalise(d):
         out = {"store": {"w": float(d.get("store", {}).get("w", DEFAULT_LAYOUT["store"]["w"])),
                          "h": float(d.get("store", {}).get("h", DEFAULT_LAYOUT["store"]["h"]))},
-               "shelves": [], "cameras": []}
+               "shelves": [], "cameras": [], "fixtures": []}
+        for i, f in enumerate(d.get("fixtures", [])):
+            kind = f.get("kind") if f.get("kind") in FIXTURE_KINDS else "fixture"
+            fx = {"id": str(f.get("id") or f"F{i + 1}"), "kind": kind, "name": f.get("name") or kind.title(),
+                  "x": float(f["x"]), "y": float(f["y"]), "w": float(f.get("w", 1.0)), "h": float(f.get("h", 0.5)),
+                  "rot": float(f.get("rot", 0)), "height": float(f.get("height", FIXTURE_KINDS[kind]))}
+            if kind == "door":
+                fx["dir"] = f.get("dir") if f.get("dir") in ("in", "out", "both") else "both"
+            out["fixtures"].append(fx)
         for i, s in enumerate(d.get("shelves", [])):
             sid = str(s.get("id") or f"S{i + 1}")
             faces = s.get("faces") or {"N": {"grid": list(CONFIG["shelf"]["grid"])}}
@@ -349,7 +366,7 @@ class Layout:
         best = (0.0, None, None)
         for s in self.data["shelves"]:
             for f in s["faces"]:
-                v = face_visibility(c, s, f, self.data["shelves"])
+                v = face_visibility(c, s, f, blockers(self.data))
                 if v > best[0]:
                     best = (v, s, f)
         return (best[1], best[2]) if best[0] > 0 else (None, None)
@@ -2716,6 +2733,21 @@ def render_3d(engine, el=34, az=-62, dpi=110):
         cx, cy = s["x"], s["y"]
         ax.text(cx, cy, z + 0.18, s["name"], ha="center", fontsize=7.5, color="#1a2a4a")
 
+    for fx in lay.data.get("fixtures", []):          # doors as a floor marker, counters/fixtures as boxes
+        c = rect_corners(fx)
+        if fx["kind"] == "door":
+            ax.add_collection3d(Poly3DCollection([[(p[0], p[1], 0.01) for p in c]], facecolors="#9be3a8",
+                                                 edgecolors="#2f8f46", linewidths=0.8))
+            ax.text(fx["x"], fx["y"], 0.25, fx["name"], ha="center", fontsize=7.5, color="#2f8f46")
+            continue
+        z = fx.get("height", 1.0)
+        faces = [[(p[0], p[1], z) for p in c]] + [[(c[i][0], c[i][1], 0), (c[(i + 1) % 4][0], c[(i + 1) % 4][1], 0),
+                                                   (c[(i + 1) % 4][0], c[(i + 1) % 4][1], z), (c[i][0], c[i][1], z)]
+                                                  for i in range(4)]
+        col = "#b7c8e6" if fx["kind"] == "counter" else "#d8d2c4"
+        ax.add_collection3d(Poly3DCollection(faces, facecolors=col, edgecolors="#31405a", linewidths=0.6))
+        ax.text(fx["x"], fx["y"], z + 0.18, fx["name"], ha="center", fontsize=7.5, color="#1a2a4a")
+
     for cm in lay.data["cameras"]:
         cx, cy, cz = cm["x"], cm["y"], cm.get("height", 2.2)
         ax.scatter([cx], [cy], [cz], s=46, c="#1f6feb", marker="o", depthshade=False)
@@ -3045,7 +3077,8 @@ td,th{font-size:14.5px;padding:9px 6px}th{font-size:13px}
 <main id="setup" style="display:none">
 <section class="card s12"><h3>Store plan <span class="sub">drag to move · scroll a number to nudge · Delete to remove</span></h3>
  <div class="bar2"><button class="pri" onclick="addShelf()">+ Shelf</button>
-  <button onclick="addCam()">+ Camera</button><div class="sep"></div>
+  <button onclick="addCam()">+ Camera</button><button onclick="addFix('door')">+ Door</button>
+  <button onclick="addFix('counter')">+ Counter</button><button onclick="addFix('fixture')">+ Fixture</button><div class="sep"></div>
   <button id="b_save" onclick="saveLay()">Save plan</button><button onclick="loadLay()">Reload</button>
   <div class="sep"></div><span class="muted" id="saved"></span></div>
  <div class="wrap"><canvas id="plan" class="plan"></canvas><div class="side" id="side"></div></div>
@@ -3083,7 +3116,9 @@ function faceSeg(s,f){const c=corners(s);return {N:[c[0],c[1]],E:[c[1],c[2]],S:[
 function faceNorm(s,f){const n={N:[0,-1],E:[1,0],S:[0,1],W:[-1,0]}[f];return rot(n[0],n[1],0,0,s.rot||0)}
 const ccw=(a,b,c)=>(c[1]-a[1])*(b[0]-a[0])>(b[1]-a[1])*(c[0]-a[0]);
 const xs=(a,b,c,d)=>ccw(a,c,d)!==ccw(b,c,d)&&ccw(a,b,c)!==ccw(a,b,d);
-function blocked(p,q,skip){for(const s of LAY.shelves){if(s.id===skip)continue;const c=corners(s);
+const FIX=()=>LAY.fixtures||(LAY.fixtures=[]);
+// counters and fixtures block a camera's view like shelves do; doors don't
+function blocked(p,q,skip){for(const s of [...LAY.shelves,...FIX().filter(f=>f.kind!=='door')]){if(s.id===skip)continue;const c=corners(s);
  for(let i=0;i<4;i++)if(xs(p,q,c[i],c[(i+1)%4]))return true}return false}
 function vis(cam,s,f){const [a,b]=faceSeg(s,f),n=faceNorm(s,f),mx=(a[0]+b[0])/2,my=(a[1]+b[1])/2;
  if((cam.x-mx)*n[0]+(cam.y-my)*n[1]<=0)return 0;
@@ -3126,6 +3161,19 @@ function planDraw(cv,opts){const IW=opts.w||1100;if(cv.width!==IW)cv.width=IW;
    X.beginPath();X.moveTo(a[0],a[1]);X.lineTo(b[0],b[1]);X.stroke();X.setLineDash([])});
   X.fillStyle='#c3c9d2';X.font='600 12px system-ui';X.textAlign='center';
   X.fillText(s.name,m(s.x),m(s.y)+4);X.textAlign='left'}
+ for(const f of FIX()){const c=corners(f).map(p=>[m(p[0]),m(p[1])]);
+  const on=opts.edit&&SEL&&SEL.t==='x'&&SEL.id===f.id,hov=HOV&&HOV.t==='x'&&HOV.id===f.id;
+  const st={door:['rgba(63,185,80,.16)','#3fb950',[7,4]],counter:['#1b2533','#5b8fd1',[]],fixture:['#221f1a','#8a8170',[]]}[f.kind];
+  X.fillStyle=hov&&!on?'#262a31':st[0];X.strokeStyle=on?'#ff3b52':st[1];X.lineWidth=on?2.5:1.6;X.setLineDash(st[2]);
+  X.beginPath();c.forEach((p,i)=>i?X.lineTo(p[0],p[1]):X.moveTo(p[0],p[1]));X.closePath();X.fill();X.stroke();X.setLineDash([]);
+  if(f.kind==='fixture'){X.save();X.beginPath();c.forEach((p,i)=>i?X.lineTo(p[0],p[1]):X.moveTo(p[0],p[1]));X.closePath();X.clip();
+   X.strokeStyle='rgba(138,129,112,.35)';X.lineWidth=1;const bx=Math.min(...c.map(p=>p[0])),by=Math.min(...c.map(p=>p[1])),
+   ex=Math.max(...c.map(p=>p[0])),ey=Math.max(...c.map(p=>p[1]));
+   for(let t=bx-(ey-by);t<ex;t+=9){X.beginPath();X.moveTo(t,ey);X.lineTo(t+(ey-by),by);X.stroke()}X.restore()}
+  const lab=f.kind==='door'?`${f.dir==='in'?'↓ ':f.dir==='out'?'↑ ':'⇅ '}${f.name}`:f.name;
+  X.font='600 12px system-ui';X.textAlign='center';X.fillStyle=f.kind==='door'?'#7ee2a0':f.kind==='counter'?'#a9c6ee':'#c9c0ad';
+  const tw=X.measureText(lab).width/2+6,lx=Math.max(tw,Math.min(IW-tw,m(f.x)));   // a door on a wall keeps its label on the plan
+  const ly=Math.max(14,Math.min(H-6,m(f.y)+4));X.fillText(lab,lx,ly);X.textAlign='left'}
  for(const c of LAY.cameras){const x=m(c.x),y=m(c.y);
   const on=opts.edit&&SEL&&SEL.t==='c'&&SEL.id===c.id;
   X.beginPath();X.arc(x,y,on?9:7,0,6.3);X.fillStyle=on?'#ff3b52':'#e4002b';X.fill();
@@ -3145,6 +3193,7 @@ function drawMini(){const c=$('mini');if(!c)return;const box=c.parentElement,zh=
 function selObj(){if(!SEL)return null;
  if(SEL.t==='s')return LAY.shelves.find(s=>s.id===SEL.id);
  if(SEL.t==='c')return LAY.cameras.find(c=>c.id===SEL.id);
+ if(SEL.t==='x')return FIX().find(f=>f.id===SEL.id);
  const c=LAY.cameras.find(c=>c.id===SEL.id);return c&&c.floor_rect}
 function handles(o){if(SEL.t==='c')return {head:[o.x+Math.cos(o.heading*Math.PI/180)*Math.min(o.range*.5,1.1),
   o.y+Math.sin(o.heading*Math.PI/180)*Math.min(o.range*.5,1.1)]};
@@ -3152,6 +3201,8 @@ function handles(o){if(SEL.t==='c')return {head:[o.x+Math.cos(o.heading*Math.PI/
 function pick(mx,my){const o=selObj();
  if(o){const hs=handles(o);for(const k in hs)if(Math.hypot(mx-hs[k][0],my-hs[k][1])<10/SC)return {t:SEL.t,id:SEL.id,mode:k}}
  for(const c of LAY.cameras)if(Math.hypot(mx-c.x,my-c.y)<12/SC)return {t:'c',id:c.id,mode:'move'};
+ for(let i=FIX().length-1;i>=0;i--){const s=FIX()[i],l=rot(mx,my,s.x,s.y,-(s.rot||0));
+  if(Math.abs(l[0]-s.x)<=s.w/2&&Math.abs(l[1]-s.y)<=s.h/2)return {t:'x',id:s.id,mode:'move'}}
  for(let i=LAY.shelves.length-1;i>=0;i--){const s=LAY.shelves[i],l=rot(mx,my,s.x,s.y,-(s.rot||0));
   if(Math.abs(l[0]-s.x)<=s.w/2&&Math.abs(l[1]-s.y)<=s.h/2)return {t:'s',id:s.id,mode:'move'}}
  for(const c of LAY.cameras){if(!c.floor_rect)continue;const f=c.floor_rect,l=rot(mx,my,f.x,f.y,-(f.rot||0));
@@ -3186,7 +3237,7 @@ function side(){const o=selObj();let h=`<div class="box"><h4>Store size</h4>
  ${f('width (m)',LAY.store.w,'LAY.store.w=Math.max(1,+this.value);dirty();draw()',0.5)}
  ${f('depth (m)',LAY.store.h,'LAY.store.h=Math.max(1,+this.value);dirty();draw()',0.5)}</div>`;
  if(!o){h+=`<div class="box"><div class="empty">Nothing selected.<br><br>
-  Add a shelf or camera, then drag it into place.<br>Click any item to edit it.</div></div>`}
+  Add shelves, cameras, doors, counters or other fixtures, then drag them into place.<br>Click any item to edit it.</div></div>`}
  else if(SEL.t==='s'){h+=`<div class="box"><h4>Shelf</h4>
   <div class="f"><span>name</span><input type="text" value="${o.name}" oninput="selObj().name=this.value;dirty();draw()"></div>
   ${f('x (m)',o.x,'selObj().x=+this.value;dirty();draw()')}${f('y (m)',o.y,'selObj().y=+this.value;dirty();draw()')}
@@ -3217,6 +3268,21 @@ function side(){const o=selObj();let h=`<div class="box"><h4>Store size</h4>
   ['entry','queue','shelf','checkout'].map(r=>`<div class="chip ${(o.roles||[]).includes(r)?'on':''}"
    onclick="tglRole('${r}')">${{entry:'count people',queue:'watch queue',shelf:'watch shelves',checkout:'self-checkout'}[r]}</div>`).join('')+
   `</div><div class="hint" style="margin-top:8px">${camNote(o)}</div></div>`}
+ else if(SEL.t==='x'){const K={door:'Door',counter:'Checkout counter',fixture:'Fixture'}[o.kind];
+  h+=`<div class="box"><h4>${K}</h4>
+  <div class="f"><span>name</span><input type="text" value="${esc(o.name)}" oninput="selObj().name=this.value;dirty();draw()"></div>
+  <div class="chips" style="margin:6px 0 8px">`+['door','counter','fixture'].map(k=>`<div class="chip ${o.kind===k?'on':''}"
+   onclick="fixKind('${k}')">${{door:'door',counter:'counter',fixture:'fixture'}[k]}</div>`).join('')+`</div>`+
+  (o.kind==='door'?`<div class="chips" style="margin-bottom:8px">`+[['in','entry'],['out','exit'],['both','entry & exit']].map(([k,l])=>
+   `<div class="chip ${o.dir===k?'on':''}" onclick="doorDir('${k}')">${l}</div>`).join('')+`</div>`:'')+`
+  ${f('x (m)',o.x,'selObj().x=+this.value;dirty();draw()')}${f('y (m)',o.y,'selObj().y=+this.value;dirty();draw()')}
+  ${f('width (m)',o.w,'selObj().w=+this.value;dirty();draw()')}${f('depth (m)',o.h,'selObj().h=+this.value;dirty();draw()')}
+  ${o.kind!=='door'?f('height (m)',o.height,'selObj().height=+this.value;dirty();draw3d()'):''}
+  ${f('rotation °',o.rot||0,'selObj().rot=+this.value;dirty();draw()',5)}
+  <div class="hint" style="margin:6px 0">${o.kind==='door'?'Shown on the plan and heatmap. Put the entry camera’s count line across it. Doesn’t block camera views.'
+   :o.kind==='counter'?'A billing counter. Point a camera with the “watch queue” job at the line in front of it. Blocks camera views like a shelf.'
+   :'Anything that isn’t a shelf — pillar, freezer, promo stand. Blocks camera views, so blind spots stay accurate.'}</div>
+  <button class="danger" onclick="del()">Delete ${K.toLowerCase()}</button></div>`}
  else h+=`<div class="box"><h4>Floor patch</h4>${f('x (m)',o.x,'selObj().x=+this.value;dirty();draw()')}
   ${f('y (m)',o.y,'selObj().y=+this.value;dirty();draw()')}${f('width (m)',o.w,'selObj().w=+this.value;dirty();draw()')}
   ${f('depth (m)',o.h,'selObj().h=+this.value;dirty();draw()')}${f('rotation °',o.rot||0,'selObj().rot=+this.value;dirty();draw()',5)}
@@ -3226,7 +3292,11 @@ function camNote(c){const r=c.roles||[];
  if(r.includes('shelf')){let best=null,bv=0;for(const s of LAY.shelves)for(const fc in s.faces){
    const v=vis(c,s,fc);if(v>bv){bv=v;best=s.name+' '+fc}}
   return best?`Watching <b>${best}</b> (${Math.round(bv*100)}% of the face).`:'No shelf face in view yet — move it or widen the lens angle.'}
- return 'Mark the entry line on the picture below.'}
+ if(r.includes('checkout'))return 'Self-checkout: hold a barcode 15–25 cm from this camera and it goes into the open cart.';
+ const near=FIX().filter(f=>f.kind==='door').map(f=>[f,Math.hypot(f.x-c.x,f.y-c.y)]).sort((a,b)=>a[1]-b[1])[0];
+ const tips=[];if(r.includes('entry'))tips.push('mark the count line on the picture below'+(near?`, across <b>${esc(near[0].name)}</b>`:''));
+ if(r.includes('queue'))tips.push('mark the queue area in front of the counter');
+ return tips.length?tips.join('; ').replace(/^./,x=>x.toUpperCase())+'.':'Pick what this camera does.'}
 function tglFace(x){const s=selObj();if(s.faces[x])delete s.faces[x];else s.faces[x]={grid:[4,6]};dirty();side();draw()}
 function tglRole(r){const c=selObj();c.roles=c.roles||[];
  if(c.roles.includes(r))c.roles=c.roles.filter(v=>v!==r);
@@ -3241,12 +3311,22 @@ function feedLine(c){if(!c)return'';const k=S&&S.cams&&S.cams[c.id];
 function del(){if(!SEL)return;
  if(SEL.t==='s')LAY.shelves=LAY.shelves.filter(s=>s.id!==SEL.id);
  else if(SEL.t==='c')LAY.cameras=LAY.cameras.filter(c=>c.id!==SEL.id);
+ else if(SEL.t==='x')LAY.fixtures=FIX().filter(f=>f.id!==SEL.id);
  else delete LAY.cameras.find(c=>c.id===SEL.id).floor_rect;
  SEL=null;dirty();side();draw()}
 function addShelf(){const id='S'+Date.now().toString(36);
  LAY.shelves.push({id,name:'Shelf '+(LAY.shelves.length+1),x:LAY.store.w/2,y:LAY.store.h/2,
   w:Math.min(2.5,LAY.store.w-1),h:0.5,rot:0,height:1.8,faces:{N:{grid:[4,6]}}});
  SEL={t:'s',id};dirty();side();draw()}
+function addFix(kind){const id='F'+Date.now().toString(36),W=LAY.store.w,H=LAY.store.h,n=FIX().filter(f=>f.kind===kind).length+1;
+ const d={door:{name:'Entry',x:W/2,y:H-0.12,w:1.2,h:0.2,height:2.1,dir:'in'},
+  counter:{name:'Counter '+n,x:W-1.2,y:H-1.2,w:1.4,h:0.6,height:1.0},
+  fixture:{name:'Fixture '+n,x:W/2,y:H/2,w:0.6,h:0.6,height:1.5}}[kind];
+ FIX().push({id,kind,rot:0,...d});SEL={t:'x',id};dirty();side();draw();draw3d()}
+function fixKind(k){const o=selObj();o.kind=k;o.height={door:2.1,counter:1.0,fixture:1.5}[k];
+ if(k==='door'&&!o.dir)o.dir='both';dirty();side();draw();draw3d()}
+function doorDir(d){const o=selObj(),auto=['Entry','Exit','Entry / exit','Door'].includes(o.name);o.dir=d;
+ if(auto)o.name={in:'Entry',out:'Exit',both:'Entry / exit'}[d];dirty();side();draw()}
 function addCam(){const id='cam'+Date.now().toString(36);
  LAY.cameras.push({id,name:'Camera '+(LAY.cameras.length+1),x:0.5,y:LAY.store.h/2,heading:0,
   fov:60,range:5,height:2.2,roles:['shelf'],source:''});
@@ -3333,7 +3413,7 @@ function raw(p){const ca=Math.cos(YAW),sa=Math.sin(YAW),cp=Math.cos(PIT),sp=Math
  return [X,-(Y*sp+z*cp)*0.72,Y*cp-z*sp]}
 let VX=0,VY=0,VS=60;
 function proj(p){const r=raw(p);return [VX+r[0]*VS,VY+r[1]*VS,r[2]]}
-function fit3d(W,H){const zs=[0,...LAY.shelves.map(s=>s.height||1.8),...LAY.cameras.map(c=>c.height||2.2)];
+function fit3d(W,H){const zs=[0,...LAY.shelves.map(s=>s.height||1.8),...LAY.cameras.map(c=>c.height||2.2),...FIX().map(f=>f.height||1)];
  const zmax=Math.max(...zs);let x0=1e9,x1=-1e9,y0=1e9,y1=-1e9;
  for(const X of [0,LAY.store.w])for(const Y of [0,LAY.store.h])for(const Z of [0,zmax]){
   const r=raw([X,Y,Z]);x0=Math.min(x0,r[0]);x1=Math.max(x1,r[0]);y0=Math.min(y0,r[1]);y1=Math.max(y1,r[1])}
@@ -3366,6 +3446,11 @@ function draw3d(){const cv=$('v3d');const W=1320,H=620;if(cv.width!==W){cv.width
    const col=!s.faces[fc]?'#22262c':(st==='EMPTY'?'#ff4d4f':st==='LOW'?'#d9a441':st==='MISPLACED'?'#a371f7':
     st==='OK'?'#3fb950':'#3a4048');
    push([[a[0],a[1],0],[b[0],b[1],0],[b[0],b[1],z],[a[0],a[1],z]],col,'#565d68',1)})}
+ for(const f of FIX()){const c=corners(f);
+  if(f.kind==='door'){push(c.map(p=>[p[0],p[1],0.004]),'rgba(63,185,80,.28)','#3fb950',1.5,[6,4]);continue}
+  const z=f.height||1,top=f.kind==='counter'?'#2a3a52':'#3a352c',side=f.kind==='counter'?'#223047':'#2e2a23';
+  push(c.map(p=>[p[0],p[1],z]),top,'#5d6573',1);
+  for(let i=0;i<4;i++){const a=c[i],b=c[(i+1)%4];push([[a[0],a[1],0],[b[0],b[1],0],[b[0],b[1],z],[a[0],a[1],z]],side,'#5d6573',1)}}
  polys.sort((a,b)=>b.d-a.d);
  for(const p of polys){X.beginPath();p.pr.forEach((q,i)=>i?X.lineTo(q[0],q[1]):X.moveTo(q[0],q[1]));
   if(p.fill){X.closePath();X.fillStyle=p.fill;X.fill()}
@@ -3374,6 +3459,9 @@ function draw3d(){const cv=$('v3d');const W=1320,H=620;if(cv.width!==W){cv.width
  for(const s of LAY.shelves){const q=proj([s.x,s.y,(s.height||1.8)+0.14]);
   X.strokeStyle='#0f1114';X.lineWidth=3.5;X.strokeText(s.name,q[0],q[1]);
   X.fillStyle='#c3c9d2';X.fillText(s.name,q[0],q[1])}
+ for(const f of FIX()){const q=proj([f.x,f.y,(f.kind==='door'?0:f.height||1)+0.14]);
+  X.strokeStyle='#0f1114';X.lineWidth=3.5;X.strokeText(f.name,q[0],q[1]);
+  X.fillStyle=f.kind==='door'?'#7ee2a0':f.kind==='counter'?'#a9c6ee':'#c9c0ad';X.fillText(f.name,q[0],q[1])}
  for(const c of LAY.cameras){const q=proj([c.x,c.y,c.height||2.2]);
   X.beginPath();X.arc(q[0],q[1],4.5,0,6.3);X.fillStyle='#ff3b52';X.fill();
   X.textAlign='left';X.strokeStyle='#0f1114';X.lineWidth=3.5;X.strokeText(c.name,q[0]+9,q[1]+4);

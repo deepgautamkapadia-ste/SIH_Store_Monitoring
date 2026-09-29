@@ -174,5 +174,32 @@ check("POST rejects junk", cl.post("/api/layout", json={"shelves": [{"x": 1}]}).
 check("3d endpoint serves PNG", cl.get("/api/layout/3d.png").content[:4] == b"\x89PNG")
 check("dashboard has the editor", "id=\"plan\"" in cl.get("/").text)
 
+# ── doors, counters and other fixtures ────────────────────────────────
+print("\nfixtures")
+base = {"store": {"w": 6, "h": 4},
+        "shelves": [{"id": "S1", "name": "Aisle", "x": 3, "y": 1, "w": 2, "h": 0.4, "faces": {"S": {"grid": [4, 6]}}}],
+        "cameras": [{"id": "c1", "x": 3, "y": 3.5, "heading": -90, "fov": 70, "range": 6, "roles": ["shelf"]}]}
+n = ss.Layout.normalise({**base, "fixtures": [
+    {"kind": "door", "x": 0.1, "y": 2, "w": 0.2, "h": 1.2, "dir": "in"},
+    {"kind": "counter", "name": "Till 1", "x": 5, "y": 3.5, "w": 1.2, "h": 0.5},
+    {"kind": "weird", "x": 1, "y": 1}]})
+fx = n["fixtures"]
+check("fixtures kept through save", len(fx) == 3 and fx[0]["kind"] == "door" and fx[0]["dir"] == "in"
+      and fx[1]["name"] == "Till 1" and fx[1]["height"] == 1.0, str(fx))
+check("unknown kind becomes a plain fixture", fx[2]["kind"] == "fixture" and fx[2]["w"] == 1.0)
+check("old plans without fixtures still load", ss.Layout.normalise(base)["fixtures"] == [])
+open_v = ss.coverage(ss.Layout.normalise(base))["S1:S"]["visible"]
+wall = {"kind": "fixture", "name": "Freezer", "x": 3, "y": 2.3, "w": 3.2, "h": 0.4}
+blocked_v = ss.coverage(ss.Layout.normalise({**base, "fixtures": [wall]}))["S1:S"]["visible"]
+door_v = ss.coverage(ss.Layout.normalise({**base, "fixtures": [{**wall, "kind": "door"}]}))["S1:S"]["visible"]
+check("a fixture between camera and shelf blocks the view", open_v > 0.9 and blocked_v == 0, f"{open_v} -> {blocked_v}")
+check("a door there doesn't", door_v == open_v, str(door_v))
+r = cl.post("/api/layout", json={**base, "fixtures": [wall]}).json()
+check("API saves fixtures and reports the blind spot", r["ok"] and r["layout"]["fixtures"][0]["name"] == "Freezer"
+      and r["coverage"]["S1:S"]["visible"] == 0)
+check("3D picture still renders with fixtures", cl.get("/api/layout/3d.png").content[:4] == b"\x89PNG")
+page = cl.get("/").text
+check("editor can add doors, counters, fixtures", "addFix('door')" in page and "addFix('counter')" in page and "addFix('fixture')" in page)
+
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILED: {fails}"))
 sys.exit(1 if fails else 0)

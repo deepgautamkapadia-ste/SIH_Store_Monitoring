@@ -17,7 +17,7 @@ The dashboard has six tabs:
 | **Checkout** | Self-checkout / billing counter: scan with a USB barcode scanner, a checkout camera, or type a SKU or name. Cart with quantities, savings vs MRP, and a bill as PNG and PDF — "please move to the payment counter" |
 | **CCTV** | Every camera as a plain security view with people boxes and counts (faces blurred here too), or with analytics overlays |
 | **Analytics** | A live strip that moves every second (people inside, entries per minute, queue, sales today), then footfall and bills per day, conversion, a weekday × hour busyness heatmap, footfall and revenue by hour, top products, stock-outs, basket sizes, queue waits — plus CSV exports for forecasting models |
-| **Setup** | Top-down store plan: drag shelves and cameras, see which shelf faces each camera covers and where the blind spots are; set a camera's entry line, queue area and floor points by clicking on its picture; orbitable 3D view |
+| **Setup** | Top-down store plan: drag shelves, cameras, doors (entry / exit), checkout counters and other fixtures (pillar, freezer, promo stand — they block camera views like shelves do), see which shelf faces each camera covers and where the blind spots are; set a camera's entry line, queue area and floor points by clicking on its picture; orbitable 3D view |
 
 ## Why it's different
 

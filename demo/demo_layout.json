@@ -231,5 +231,41 @@
       ],
       "source": "demo/till.mp4"
     }
+  ],
+  "fixtures": [
+    {
+      "id": "door1",
+      "kind": "door",
+      "name": "Entry / exit",
+      "x": 0.1,
+      "y": 2.0,
+      "w": 0.2,
+      "h": 1.2,
+      "rot": 0,
+      "height": 2.1,
+      "dir": "both"
+    },
+    {
+      "id": "cnt1",
+      "kind": "counter",
+      "name": "Counter 1",
+      "x": 4.6,
+      "y": 0.55,
+      "w": 1.2,
+      "h": 0.5,
+      "rot": 0,
+      "height": 1.0
+    },
+    {
+      "id": "fx1",
+      "kind": "fixture",
+      "name": "Freezer",
+      "x": 5.55,
+      "y": 1.9,
+      "w": 0.6,
+      "h": 1.0,
+      "rot": 0,
+      "height": 1.4
+    }
   ]
 }
