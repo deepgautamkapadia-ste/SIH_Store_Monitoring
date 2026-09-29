@@ -156,16 +156,19 @@ check("slots survive save/normalise", len(lay.cam("shelfP")["slots"]) == 3 and
 sw = ss.ShelfWorker("shelfP", {"shelf"}, "dummy_pos.mp4", eng)
 
 
-def shelf(missing=()):
-    """Each facing is a boxy product with strong edges; missing ones are bare shelf."""
+def shelf(missing=(), swapped=()):
+    """Each facing is a boxy product with strong edges; missing ones are bare shelf; swapped ones hold a
+    different product (other colours, same shape)."""
     img = np.full((480, 640, 3), 50, np.uint8)
     rng = np.random.default_rng(1)
     H, W = img.shape[:2]
     for s in slots:
         for i, a, b, c, d in ss.ShelfWorker.facing_boxes(s, W, H):
+            col = tuple(int(v) for v in rng.integers(80, 255, 3))     # same colours whatever is missing
             if (s["id"], i) in missing:
                 continue
-            col = tuple(int(v) for v in rng.integers(80, 255, 3))
+            if (s["id"], i) in swapped:
+                col = (int(255 - col[0] * 0.3), int(col[2] * 0.2), int(255 - col[1] * 0.5))
             cv2.rectangle(img, (a + 4, b + 6), (c - 4, d - 4), col, -1)
             cv2.rectangle(img, (a + 4, b + 6), (c - 4, d - 4), (15, 15, 15), 2)
             cv2.putText(img, "SS", (a + 8, b + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
@@ -227,6 +230,50 @@ moved = [dict(slots[0], facings=2)] + slots[1:]
 cells2 = {c["slot"]: c for c in sw.read_slots(shelf(), moved, [])}
 check("changing facings needs no recalibration", cells2["a"]["facings"] == 2 and cells2["a"]["present"] == 2)
 
+# ── planogram: a different product in a box ──────────────────────────
+print("\nplanogram")
+sw.slot_sig = None
+for _ in range(3):
+    sw.step(shelf())
+cells = {c["slot"]: c for c in eng.shelves["shelfP"]}
+check("right products -> no wrong-product flag", not any(c["misplaced"] for c in cells.values()),
+      str({k: c["match"] for k, c in cells.items()}))
+for _ in range(3):
+    sw.step(shelf(missing={("a", 0), ("a", 1)}))
+cells = {c["slot"]: c for c in eng.shelves["shelfP"]}
+check("taking products out is not 'wrong product'", not cells["a"]["misplaced"], str(cells["a"]["match"]))
+for _ in range(3):
+    sw.step(shelf(swapped={("c", i) for i in range(6)}))
+cells = {c["slot"]: c for c in eng.shelves["shelfP"]}
+check("a different product in a box is flagged", cells["c"]["misplaced"] and not cells["a"]["misplaced"],
+      f"match {cells['c']['match']}")
+al = [a for a in eng.snapshot()["alerts"] if "different product" in a["message"]]
+check("...with an alert naming the product and spot", al and "row 2 · col 1" in al[0]["message"], al[0]["message"] if al else "none")
+for _ in range(4):
+    sw.step(shelf())
+check("put back -> flag and alert clear", not {c["slot"]: c for c in eng.shelves["shelfP"]}["c"]["misplaced"]
+      and not [a for a in eng.snapshot()["alerts"] if "different product" in a["message"]])
+
+# ── shopper attention per product ─────────────────────────────────────
+print("\nattention")
+fr = shelf()
+bx = next(s for s in slots if s["id"] == "b")
+over = [[bx["x"] * 640, bx["y"] * 480 - 60, (bx["x"] + bx["w"]) * 640, 479]]
+t0 = time.time()
+for k in range(13):                              # 3 s in front of product b
+    sw.track_attention(fr, over, t0 + k * 0.25)
+for k in range(8):                               # then gone
+    sw.track_attention(fr, [], t0 + 3.25 + k * 0.25)
+for k in range(4):                               # someone walking past: 0.75 s
+    sw.track_attention(fr, over, t0 + 6 + k * 0.25)
+for k in range(8):
+    sw.track_attention(fr, [], t0 + 7 + k * 0.25)
+att = eng.attention_today("shelfP", "b")
+check("a 3 s stop is counted, a walk-past isn't", att["visits"] == 1 and 2.5 <= att["avg_s"] <= 3.5, str(att))
+last = [json.loads(d) for (d,) in store.q("SELECT data FROM events WHERE type='product_dwell' ORDER BY id")]
+last = [d for d in last if d["slot"] == "b"][-1]
+check("stop logged for analytics", last["slot"] == "b" and 2.5 <= last["s"] <= 3.5, str(last))
+
 # ── API ───────────────────────────────────────────────────────────────
 print("\napi")
 from fastapi.testclient import TestClient
@@ -254,6 +301,56 @@ ok = cl.post("/api/slots/shelfP", json={"slots": slots[:2]}).json()
 check("slots API saves", ok["ok"] and len(lay.cam("shelfP")["slots"]) == 2)
 check("reference still served", cl.get("/api/shelf/shelfP/still.jpg").content[:2] == b"\xff\xd8")
 check("snapshot carries POS state", "pos" in eng.snapshot())
+
+# ── integrations ─────────────────────────────────────────────────────
+print("\nintegrations")
+r = cl.post("/api/integrations/products", content="sku,name,brand,mrp,price\nbhujia-200,Haldiram Bhujia 200g,Haldiram,60,55\n"
+            "bad-price,Bad,X,10,20\n", headers={"Content-Type": "text/csv"}).json()
+check("catalog CSV import, bad rows reported", r["imported"] == 1 and len(r["errors"]) == 1 and store.product_get("bhujia-200"),
+      str(r))
+r = cl.post("/api/integrations/products", json=[{"sku": "tea-250", "name": "Tea 250g", "mrp": 120}]).json()
+check("catalog JSON import", r["imported"] == 1)
+before = eng.pos_units("maggi-70", None)
+r = cl.post("/api/integrations/restock", json={"items": [{"sku": "maggi-70", "qty": 10}]}).json()
+check("delivery adds to the till stock", r["levels"]["maggi-70"] == (before or 0) + 10, f"{before} -> {r['levels']}")
+st = cl.get("/api/integrations/stock").json()
+m = next(p for p in st["products"] if p["sku"] == "maggi-70")
+check("stock pull: camera count, till count, place", m["till_units"] == (before or 0) + 10 and m["shelves"]
+      and "row" in m["shelves"][0]["where"], str(m)[:200])
+check("sales pull", any(b["id"] == bj["bill"]["id"] for b in cl.get("/api/integrations/sales?since=0").json()["bills"]))
+
+import http.server, socketserver, threading
+GOT = []
+
+
+class Hook(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        GOT.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+        self.send_response(200)
+        self.end_headers()
+
+
+srv = socketserver.TCPServer(("127.0.0.1", 8767), Hook)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+ss.CONFIG["webhooks"] = ["http://127.0.0.1:8767/hook", {"url": "http://127.0.0.1:9/down", "events": ["bill"]}]
+threading.Thread(target=ss.webhook_sender, args=(eng, store), daemon=True).start()
+eng.fire("test:hook", "stock", 3, "webhook test alert", "Refill")
+c = cl.post("/api/cart").json()
+cl.post(f"/api/cart/{c['id']}/scan", json={"code": "tea-250"})
+cl.post(f"/api/cart/{c['id']}/checkout")
+deadline = time.time() + 15
+while time.time() < deadline and not {"alert", "bill"} <= {g["type"] for g in GOT}:
+    time.sleep(0.2)
+check("webhooks deliver alert and bill events", {"alert", "bill"} <= {g["type"] for g in GOT},
+      str([g["type"] for g in GOT]))
+check("event names the store", all(g["store_id"] == ss.CONFIG["store_id"] for g in GOT))
+time.sleep(4)
+check("unreachable system: its events stay queued for retry", cl.get("/api/integrations").json()["queued"] >= 1)
+ss.CONFIG["webhooks"] = []
+srv.shutdown()
 
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILED: {fails}"))
 sys.exit(1 if fails else 0)

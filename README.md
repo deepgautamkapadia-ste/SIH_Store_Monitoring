@@ -16,7 +16,7 @@ The dashboard has six tabs:
 | **Shelves** | Draw a box around each product on the shelf picture, attach the product (SKU, barcode, brand, MRP, price), say how many sit side by side, how deep they stack and how big one unit is (that turns on depth counting). Live per-product stock table and a depth view. Product catalog with printable barcode labels |
 | **Checkout** | Self-checkout / billing counter: scan with a USB barcode scanner, a checkout camera, or type a SKU or name. Cart with quantities, savings vs MRP, and a bill as PNG and PDF — "please move to the payment counter" |
 | **CCTV** | Every camera as a plain security view with people boxes and counts (faces blurred here too), or with analytics overlays |
-| **Analytics** | Footfall and bills per day, conversion, a weekday × hour busyness heatmap, footfall and revenue by hour, top products, stock-outs, basket sizes, queue waits — plus CSV exports for forecasting models |
+| **Analytics** | A live strip that moves every second (people inside, entries per minute, queue, sales today), then footfall and bills per day, conversion, a weekday × hour busyness heatmap, footfall and revenue by hour, top products, stock-outs, basket sizes, queue waits — plus CSV exports for forecasting models |
 | **Setup** | Top-down store plan: drag shelves and cameras, see which shelf faces each camera covers and where the blind spots are; set a camera's entry line, queue area and floor points by clicking on its picture; orbitable 3D view |
 
 ## Why it's different
@@ -25,6 +25,8 @@ The dashboard has six tabs:
 - **Counts units behind the front row — with one ordinary camera, at any angle.** When the front unit of a column is taken, the next one is still there, just further back. A monocular depth model (Depth Anything V2, metric indoor) estimates distance for every pixel; StoreSense turns that into 3-D points, finds the plane of the product fronts on the full shelf, and gives every column a "tube" going back from it. The nearest solid surface in the tube, divided by the size of one unit, is how many are gone. See [How depth counting works](#how-depth-counting-works).
 - **Honest about what it can't see.** From some angles a deep gap is hidden by the units beside it. Those columns are marked hidden (the front unit is known to be gone; the rest isn't guessed). Products without a unit size fall back to an estimate — facings still visible × how deep they stack — labelled as one. Where the till is used, stock is also tracked exactly: calibrating sets the level, each sale decrements it. Both numbers are shown side by side.
 - **Model your store, don't match a template.** Shelves and cameras go anywhere on the plan. Which shelf face a camera watches is computed from its position, lens angle, range and line of sight, so blind spots show up before you mount anything.
+- **Wrong product in a box is caught.** Each product box remembers its product's colours from the calibration picture; if something else ends up there, it's flagged "wrong product" with an alert — separately from low stock, so taking items out never looks like a planogram error.
+- **Shopper attention per product.** The shelf camera times how long people stand in front of each product box (stops under 1.5 s are walk-pasts and don't count). Shown per product on the Shelves tab and as a chart in Analytics, next to dwell per store zone.
 - **Occlusion-aware.** When a shopper stands in front of a product, that box keeps its last reading instead of raising a false "empty".
 - **Checkout that works with what a shop has.** A basic USB barcode scanner, a phone pointed at the counter, or typing. Products without a barcode get an in-store EAN-13 from the GS1 20–29 range reserved for exactly this, with a printable label.
 - **Runs offline, private by design.** Detection, storage, billing and the dashboard all run on the edge box. Only anonymous track IDs and numbers are stored — no frames, no faces. Heads are blurred on every view, including CCTV, and model telemetry is disabled.
@@ -96,6 +98,19 @@ python storesense.py --depth-test full.jpg taken.jpg
 It prints the fit error and how far back the changed area moved, and writes `depth_test.png`. On Qualcomm hardware the same model family is available from [Qualcomm AI Hub](https://aihub.qualcomm.com/models/depth_anything_v2) for the Hexagon NPU.
 
 **Tested:** on a ray-traced shelf with known true depth, with the model replaced by true depth plus scale/offset drift, blur, low-frequency error and noise (`tests/test_depth.py`): from straight on, 18° to the side and 14° from above, every column the camera could see was counted exactly; up to two columns per view were correctly reported hidden. **Not yet tested:** the real model on a real shelf — thin products (under ~3 cm deep) and shiny or transparent packs are the likely weak spots.
+
+## Integrations (POS, inventory, ERP)
+
+| Call | What it does |
+|---|---|
+| `POST /api/integrations/pos` | Record a sale made on another till |
+| `POST /api/integrations/products` | Import the catalog — JSON list or CSV (`sku,name,brand,barcode,mrp,price`); also the **Import CSV** button in Shelves → catalog |
+| `POST /api/integrations/restock` | A delivery arrived: `{"items":[{"sku":"…","qty":12}],"mode":"add"\|"set"}` |
+| `GET /api/integrations/stock` | Every product: where it sits, camera count, till count, status, wrong-product flag |
+| `GET /api/integrations/sales?since=<unix time>` | Bills since a time |
+| Webhooks | Set `"webhooks": ["https://…"]` in the config (or `{"url": …, "events": [...]}`). Events `alert`, `bill`, `stock` (a product's shelf status changed), `restock` are POSTed as JSON, queued in SQLite and retried — nothing is lost while offline |
+
+These are generic REST/JSON; a specific ERP (Tally, SAP, Zoho…) needs a small adapter that calls them.
 
 ## Data for forecasting
 

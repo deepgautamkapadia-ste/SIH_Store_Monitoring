@@ -185,6 +185,32 @@ check("fps shown is the camera's real frame rate, not processing speed", 0.6 * s
       f"shown {fps}, video {src_fps:.0f}")
 w2.stop()
 
+print("\nlive view")
+w3 = ss.start_cam(eng, workers, "walk2", ["entry"], "../demo/walk.mp4")
+wait(lambda: w3.jpg is not None and w3.blur_t > 0)
+seen = set()
+for _ in range(20):
+    j = w3.live_jpg("analytics")
+    if j:
+        seen.add(hash(j))
+    time.sleep(0.1)
+check("live picture changes with every camera frame", len(seen) >= 8, f"{len(seen)} distinct in 2 s")
+w3.blur_t = time.time() - 5
+check("detection stalled -> no live frame (falls back to the processed, blurred one)", w3.live_jpg("analytics") is None)
+w3.stop()
+
+print("\nalerts")
+eng.fire("shelf:camX:0,1", "stock", 3, "grid cell empty", "Critical refill")
+eng.fire("shelf:camX:p1", "stock", 3, "Maggi empty", "Critical refill")
+cell = {"slot": "p1", "name": "Maggi", "loc": "row 1 · col 1", "occluded": False, "status": "EMPTY",
+        "est_units": 0, "full_units": 4, "eta_min": None}
+eng.on_shelf("camX", [cell])
+msgs = [a["message"] for a in eng.snapshot()["alerts"]]
+check("old grid alerts cleared once product boxes report", "grid cell empty" not in msgs and any("Maggi" in m for m in msgs),
+      str(msgs))
+r = cli.get("/api/live?minutes=60").json()
+check("live history endpoint answers", "rows" in r and "now" in r)
+
 page = cli.get("/").text
 check("setup shows the feed status and a self-checkout job", "feedLine" in page and "self-checkout" in page)
 check("dashboard uses paced frames, no open-ended streams", "liveTick" in page and 'src="/video/' not in page)
