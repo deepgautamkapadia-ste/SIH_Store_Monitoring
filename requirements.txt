@@ -4,5 +4,7 @@ fastapi
 uvicorn[standard]
 opencv-python
 numpy
+matplotlib
+trimesh
 # tests only
 httpx

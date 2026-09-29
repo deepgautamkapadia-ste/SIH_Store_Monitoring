@@ -17,3 +17,6 @@ tests/*.db
 layout.json
 layout.json.tmp
 tests/*.json
+
+# generated room-model geometry and previews
+storage/room_models/

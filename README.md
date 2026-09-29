@@ -104,6 +104,48 @@ python tests/test_layout.py  # 48 checks: layout geometry, coverage, store mappi
 python tests/test_real.py    # real YOLO on a generated walk-through video
 ```
 
+### USDZ room-model processing (developer preview)
+
+The room-model processor is an independent Python package in `room_model/`.
+It does not change the live dashboard or the existing layout JSON. A future
+upload endpoint can save a file and call the same function:
+
+```python
+from room_model import process_room_model
+
+result = process_room_model(saved_usdz_path)
+# Return result from an API route after the upload handler saves the file.
+```
+
+Install the Python dependencies and **Blender 4.0 or newer**. Blender must be
+available as `blender` on `PATH`, or set `BLENDER_EXECUTABLE` to its executable:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.txt
+$env:BLENDER_EXECUTABLE = "C:\Program Files\Blender Foundation\Blender 4.5\blender.exe"
+.\.venv\Scripts\python scripts/test_room_model.py C:\path\to\room.usdz
+.\.venv\Scripts\python -m unittest discover -s tests -p test_room_model.py
+```
+
+On Linux/macOS, use `python3 -m venv .venv`, `.venv/bin/python -m pip install -r requirements.txt`,
+and either put `blender` on `PATH` or `export BLENDER_EXECUTABLE=/path/to/blender`.
+Run the script with `.venv/bin/python scripts/test_room_model.py /path/to/room.usdz`.
+The override is optional on Windows too: common Blender Foundation install
+folders are searched automatically. The manual script requires an actual,
+non-empty `.usdz` scan. It prints conversion status, OBJ and preview paths,
+vertex and face counts, and dimensions.
+
+Each successful call creates `storage/room_models/<model_id>/model.obj` and
+`preview.png`; generated files are ignored by Git. The returned metadata
+contains the source and output paths, vertex and face counts, axis-aligned
+bounds, dimensions, and bounds center. Values remain in the model's source
+units; no floor, wall, scale calibration, or alignment with the dashboard
+layout is inferred yet. Blender exports triangulated, Z-up geometry without
+UVs or materials. Trimesh combines OBJ objects and instances with their
+transforms. Matplotlib renders a debug PNG from at most 20,000 faces; the
+full OBJ and mesh geometry are unaffected.
+
 ## Status
 
 **Working:** everything in the feature table, tested on synthetic video and with the real detector.
