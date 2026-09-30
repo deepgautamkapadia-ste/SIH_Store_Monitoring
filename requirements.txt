@@ -4,6 +4,7 @@ fastapi
 uvicorn[standard]
 opencv-python
 numpy
+transformers    # depth model for counting units behind the front row (optional)
 matplotlib
 trimesh
 # tests only

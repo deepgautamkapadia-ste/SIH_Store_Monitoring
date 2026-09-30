@@ -1,20 +1,271 @@
 {
-  "store": {"w": 10.0, "h": 7.0},
+  "store": {
+    "w": 6.0,
+    "h": 4.0
+  },
   "shelves": [
-    {"id": "S1", "name": "Aisle 1 - A", "x": 4.0, "y": 2.0, "w": 4.0, "h": 0.6, "rot": 0,
-     "height": 1.8, "faces": {"S": {"grid": [4, 6]}}},
-    {"id": "S2", "name": "Aisle 1 - B", "x": 4.0, "y": 5.0, "w": 4.0, "h": 0.6, "rot": 0,
-     "height": 1.8, "faces": {"N": {"grid": [3, 5]}}},
-    {"id": "S3", "name": "Promo island", "x": 8.2, "y": 5.2, "w": 1.6, "h": 1.6, "rot": 30,
-     "height": 1.2, "faces": {"N": {"grid": [2, 3]}, "W": {"grid": [2, 3]}}}
+    {
+      "id": "S1",
+      "name": "Aisle A",
+      "x": 2.6,
+      "y": 1.0,
+      "w": 1.8,
+      "h": 0.45,
+      "rot": 0.0,
+      "height": 1.8,
+      "faces": {
+        "S": {
+          "grid": [
+            4,
+            6
+          ]
+        }
+      }
+    },
+    {
+      "id": "S2",
+      "name": "Aisle B",
+      "x": 2.6,
+      "y": 2.8,
+      "w": 1.8,
+      "h": 0.45,
+      "rot": 0.0,
+      "height": 1.8,
+      "faces": {
+        "N": {
+          "grid": [
+            3,
+            5
+          ]
+        }
+      }
+    },
+    {
+      "id": "S3",
+      "name": "Promo island",
+      "x": 5.0,
+      "y": 3.1,
+      "w": 0.9,
+      "h": 0.9,
+      "rot": 30.0,
+      "height": 1.1,
+      "faces": {
+        "N": {
+          "grid": [
+            2,
+            3
+          ]
+        },
+        "W": {
+          "grid": [
+            2,
+            3
+          ]
+        }
+      }
+    }
   ],
   "cameras": [
-    {"id": "entry", "name": "Entry", "x": 0.6, "y": 3.5, "heading": 0, "fov": 80, "range": 9,
-     "height": 2.4, "roles": ["entry", "queue"], "source": "demo/walk.mp4",
-     "floor_rect": {"x": 3.0, "y": 3.5, "w": 5.0, "h": 3.0, "rot": 0}},
-    {"id": "shelfA", "name": "Aisle cam A", "x": 4.0, "y": 4.65, "heading": -90, "fov": 120,
-     "range": 6, "height": 1.9, "roles": ["shelf"], "source": "demo/shelf.mp4"},
-    {"id": "shelfB", "name": "Aisle cam B", "x": 4.0, "y": 2.35, "heading": 90, "fov": 120,
-     "range": 6, "height": 1.9, "roles": ["shelf"], "source": ""}
+    {
+      "id": "entry",
+      "name": "Entry",
+      "x": 0.4,
+      "y": 2.0,
+      "heading": 0.0,
+      "fov": 70.0,
+      "range": 5.0,
+      "height": 2.3,
+      "roles": [
+        "entry",
+        "queue"
+      ],
+      "source": "demo/walk.mp4",
+      "floor_rect": {
+        "x": 2.2,
+        "y": 2.0,
+        "w": 3.2,
+        "h": 1.9,
+        "rot": 0.0
+      }
+    },
+    {
+      "id": "shelfA",
+      "name": "Aisle cam A",
+      "x": 2.6,
+      "y": 2.5,
+      "heading": -90.0,
+      "fov": 70.0,
+      "range": 4.0,
+      "height": 1.9,
+      "roles": [
+        "shelf"
+      ],
+      "source": "demo/shelf.mp4",
+      "slots": [
+        {
+          "id": "d1",
+          "name": "Maggi",
+          "sku": "maggi-70",
+          "x": 0.004,
+          "y": 0.035,
+          "w": 0.3232,
+          "h": 0.185,
+          "facings": 6,
+          "deep": 4
+        },
+        {
+          "id": "d2",
+          "name": "Parle-G",
+          "sku": "parleg-250",
+          "x": 0.3352,
+          "y": 0.035,
+          "w": 0.3232,
+          "h": 0.185,
+          "facings": 6,
+          "deep": 3
+        },
+        {
+          "id": "d3",
+          "name": "Lay's",
+          "sku": "lays-52",
+          "x": 0.6665,
+          "y": 0.035,
+          "w": 0.3232,
+          "h": 0.185,
+          "facings": 6,
+          "deep": 2
+        },
+        {
+          "id": "d4",
+          "name": "Kurkure",
+          "sku": "kurkure-90",
+          "x": 0.004,
+          "y": 0.285,
+          "w": 0.4889,
+          "h": 0.185,
+          "facings": 9,
+          "deep": 2
+        },
+        {
+          "id": "d5",
+          "name": "Coca-Cola",
+          "sku": "coke-750",
+          "x": 0.5009,
+          "y": 0.285,
+          "w": 0.4889,
+          "h": 0.185,
+          "facings": 9,
+          "deep": 2
+        },
+        {
+          "id": "d6",
+          "name": "Colgate",
+          "sku": "colgate-200",
+          "x": 0.004,
+          "y": 0.535,
+          "w": 0.3232,
+          "h": 0.185,
+          "facings": 6,
+          "deep": 3
+        },
+        {
+          "id": "d7",
+          "name": "Amul Butter",
+          "sku": "amul-butter-100",
+          "x": 0.3352,
+          "y": 0.535,
+          "w": 0.3232,
+          "h": 0.185,
+          "facings": 6,
+          "deep": 2
+        },
+        {
+          "id": "d8",
+          "name": "Dove",
+          "sku": "dove-sh-180",
+          "x": 0.6665,
+          "y": 0.535,
+          "w": 0.3232,
+          "h": 0.185,
+          "facings": 6,
+          "deep": 2
+        },
+        {
+          "id": "d9",
+          "name": "Tata Salt",
+          "sku": "tata-salt-1kg",
+          "x": 0.004,
+          "y": 0.785,
+          "w": 0.9857,
+          "h": 0.185,
+          "facings": 18,
+          "deep": 2
+        }
+      ]
+    },
+    {
+      "id": "shelfB",
+      "name": "Aisle cam B",
+      "x": 2.6,
+      "y": 1.3,
+      "heading": 90.0,
+      "fov": 70.0,
+      "range": 4.0,
+      "height": 1.9,
+      "roles": [
+        "shelf"
+      ],
+      "source": ""
+    },
+    {
+      "id": "till",
+      "name": "Self checkout",
+      "x": 5.5,
+      "y": 0.6,
+      "heading": 135.0,
+      "fov": 60.0,
+      "range": 2.0,
+      "height": 1.2,
+      "roles": [
+        "checkout"
+      ],
+      "source": "demo/till.mp4"
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "door1",
+      "kind": "door",
+      "name": "Entry / exit",
+      "x": 0.1,
+      "y": 2.0,
+      "w": 0.2,
+      "h": 1.2,
+      "rot": 0,
+      "height": 2.1,
+      "dir": "both"
+    },
+    {
+      "id": "cnt1",
+      "kind": "counter",
+      "name": "Counter 1",
+      "x": 4.6,
+      "y": 0.55,
+      "w": 1.2,
+      "h": 0.5,
+      "rot": 0,
+      "height": 1.0
+    },
+    {
+      "id": "fx1",
+      "kind": "fixture",
+      "name": "Freezer",
+      "x": 5.55,
+      "y": 1.9,
+      "w": 0.6,
+      "h": 1.0,
+      "rot": 0,
+      "height": 1.4
+    }
   ]
 }
