@@ -7,5 +7,6 @@ numpy
 transformers    # depth model for counting units behind the front row (optional)
 matplotlib
 trimesh
+sqlalchemy
 # tests only
 httpx

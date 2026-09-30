@@ -40,6 +40,44 @@ python storesense.py              # laptop webcam as entry + queue camera
 
 Open http://localhost:8000. The YOLO weights (~5 MB) download on the first run.
 
+### Inventory: shelf and storeroom
+
+Inventory uses the same local `storesense.db` and product catalog as checkout. The API
+adds quantities, thresholds, an event history, and a single active decision per
+product. A low shelf with available storeroom stock raises `SHELF_REFILL`; low stock
+in both places raises `REORDER_REQUIRED`; a healthy shelf with low storeroom stock
+raises `STOREROOM_LOW`. These appear in the existing alert list and in
+`/api/state` and `/ws` under `inventory`. Raising stock above thresholds resolves
+the alert. Repeated camera readings with the same quantity create no extra event.
+
+Marked shelf camera slots linked to an inventoried SKU update shelf quantity through
+the inventory service. Occluded and misplaced readings are ignored. The existing
+shelf grid and alerts continue to work for products without inventory records.
+
+Start the app with `python storesense.py`, then use these examples in another shell
+(PowerShell):
+
+```powershell
+$base = 'http://localhost:8000/api/inventory'
+$p = Invoke-RestMethod -Method Post -Uri "$base/products" -ContentType 'application/json' -Body '{"sku":"COKE-500","name":"Coca Cola 500ml","shelf_quantity":30,"shelf_capacity":40,"shelf_low_threshold":10,"storeroom_quantity":100,"storeroom_low_threshold":20}'
+$id = $p.id
+Invoke-RestMethod -Method Patch -Uri "$base/products/$id/shelf" -ContentType 'application/json' -Body '{"quantity":7,"source":"camera"}'
+Invoke-RestMethod -Method Patch -Uri "$base/products/$id/storeroom" -ContentType 'application/json' -Body '{"quantity":10,"source":"employee"}'
+Invoke-RestMethod -Method Post -Uri "$base/products/$id/transfer-to-shelf" -ContentType 'application/json' -Body '{"quantity":5,"source":"employee"}'
+Invoke-RestMethod -Uri "$base/status"
+Invoke-RestMethod -Uri 'http://localhost:8000/api/state'
+```
+
+The inventory API also provides `GET /products`, `GET /products/{id}`,
+`PATCH /products/{id}` for name and thresholds, `GET /events`, and
+`GET /products/{id}/events`. All paths above are under `/api/inventory`.
+Run `python scripts/test_inventory.py` for five isolated scenarios without a camera,
+or `python -m unittest discover -s tests -p test_inventory.py -v` for automated tests.
+
+Inventory SQL is isolated in `inventory/database.py`, sharing StoreSense's SQLite
+connection and lock. A future PostgreSQL or MySQL repository can replace it while
+leaving the service, rules, and routes intact; no database migration is performed now.
+
 ### Full demo, no cameras needed
 
 ```bash

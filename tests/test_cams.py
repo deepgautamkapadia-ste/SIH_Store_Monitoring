@@ -214,6 +214,7 @@ check("live history endpoint answers", "rows" in r and "now" in r)
 page = cli.get("/").text
 check("setup shows the feed status and a self-checkout job", "feedLine" in page and "self-checkout" in page)
 check("dashboard uses paced frames, no open-ended streams", "liveTick" in page and 'src="/video/' not in page)
+store.db.close()  # release the SQLite file before cleanup on Windows
 for f in ("cams.db", "cams_layout.json"):
     if os.path.exists(f):
         os.remove(f)

@@ -696,6 +696,8 @@ class Store:
                 if "demo" not in cols:
                     self.db.execute(f"ALTER TABLE {tbl} ADD COLUMN demo INTEGER DEFAULT 0")
             self.db.commit()
+        from inventory.database import InventoryRepository
+        self.inventory_repo = InventoryRepository(self)
 
     # ── product catalog ──────────────────────────────────────────────
     PRODUCT_FIELDS = ("sku", "barcode", "name", "brand", "mrp", "price")
@@ -739,6 +741,8 @@ class Store:
 
     def product_delete(self, sku):
         with self.lock:
+            if self.db.execute("SELECT 1 FROM inventory_stock WHERE sku=?", (sku,)).fetchone():
+                raise ValueError("remove inventory before deleting this catalog product")
             self.db.execute("DELETE FROM products WHERE sku=?", (sku,))
             self.db.commit()
 
@@ -887,6 +891,8 @@ class Engine:
         self.open_counters = CONFIG["queue"]["open_counters"]
         self.online = None
         self.refresh_daily()
+        from inventory.service import InventoryService
+        self.inventory = InventoryService(store, self)
 
     def fire(self, key, kind, sev, msg, action, weight=1.0):
         now = time.time()
@@ -1119,6 +1125,8 @@ class Engine:
             self.shelves[cam] = cells
         if not cells:
             return
+        self.inventory.observe_cells(cells)
+        inventoried = {p["sku"] for p in self.inventory.list_products()}
         w = CONFIG["shelf"]["weights"].get(cam, 1.0)
         where = self.labels.get(cam, cam)
         for c in cells:
@@ -1129,7 +1137,9 @@ class Engine:
                 loc = f"{c['name']} — {where}, {c.get('loc', '')}"
             else:
                 key, loc = f"shelf:{cam}:{c['r']},{c['c']}", f"{where} row {c['r'] + 1} col {c['c'] + 1}"
-            if c["status"] == "EMPTY":
+            if c.get("sku") in inventoried:
+                self.resolve(key)
+            elif c["status"] == "EMPTY":
                 self.fire(key, "stock", 3, f"{loc} is empty", "Critical refill", w)
             elif c["status"] == "LOW":
                 left = f" — about {c['est_units']} of {c['full_units']} left" if "slot" in c else \
@@ -1233,6 +1243,7 @@ class Engine:
                                 for z, s in zs.items()} for cam, zs in self.zone_stats.items()},
                 "avg_time_in_queue_min": round(float(np.mean(self.served)) / 60, 2) if self.served else None,
                 "cams": dict(self.cams), "alerts": alerts[:50],
+                "inventory": self.inventory.status(),
                 "labels": dict(self.labels), "cam_face": dict(self.cam_face),
                 "depth": dict(self.depth_info), "depth_model_err": DEPTH["err"],
                 "pos_tracked": len(self.stock),
@@ -4190,6 +4201,8 @@ def make_app(engine, workers, store):
     from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
     app = FastAPI(title="StoreSense Edge")
+    from inventory.routes import make_router
+    app.include_router(make_router(engine.inventory))
 
     @app.get("/", response_class=HTMLResponse)
     def index():
@@ -4438,7 +4451,10 @@ def make_app(engine, workers, store):
 
     @app.delete("/api/products/{sku}")
     def delete_product(sku: str):
-        store.product_delete(sku)
+        try:
+            store.product_delete(sku)
+        except ValueError as e:
+            raise HTTPException(409, str(e)) from e
         return {"ok": True}
 
     @app.get("/api/products/{sku}/label.png")
