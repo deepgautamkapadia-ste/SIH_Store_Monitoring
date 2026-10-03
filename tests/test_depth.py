@@ -94,6 +94,9 @@ check("rejects an implausible fit (view changed)", n2 is None)
 
 # ── one shelf camera, several views ──────────────────────────────────
 def setup(view):
+    previous = globals().get("eng")
+    if previous is not None:
+        previous.store.db.close()  # Windows keeps SQLite files locked until closed
     for f in ("depth.db", "depth_layout.json", "shelf_ref_shelfD.png"):
         if os.path.exists(f):
             os.remove(f)
@@ -215,6 +218,7 @@ check("dashboard has depth controls", "b_depth" in page and "one unit, front to 
 with open("depth_view_test.jpg", "wb") as fh:
     fh.write(cli.get("/api/depth/shelfD.jpg").content)
 
+eng.store.db.close()
 for f in ("depth.db", "depth_layout.json", "shelf_ref_shelfD.png"):
     if os.path.exists(f):
         os.remove(f)

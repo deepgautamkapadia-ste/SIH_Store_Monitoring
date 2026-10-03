@@ -278,6 +278,10 @@ check("payload buffered", len(store.outbox_pending()) == 1)
 t = __import__("threading").Thread(target=ss.cloud_sync, args=(engine, store), daemon=True)
 t.start()
 time.sleep(32)
+for _ in range(12):  # a sandboxed loopback request may use most of its 10 s timeout
+    if engine.online is not None:
+        break
+    time.sleep(1)
 check("stays buffered while offline", len(store.outbox_pending()) == 1 and engine.online is False,
       f"online={engine.online}")
 ss.CONFIG["cloud_url"] = None

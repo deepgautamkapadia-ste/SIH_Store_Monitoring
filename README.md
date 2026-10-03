@@ -40,6 +40,44 @@ python storesense.py              # laptop webcam as entry + queue camera
 
 Open http://localhost:8000. The YOLO weights (~5 MB) download on the first run.
 
+### Inventory: shelf and storeroom
+
+Inventory uses the same local `storesense.db` and product catalog as checkout. The API
+adds quantities, thresholds, an event history, and a single active decision per
+product. A low shelf with available storeroom stock raises `SHELF_REFILL`; low stock
+in both places raises `REORDER_REQUIRED`; a healthy shelf with low storeroom stock
+raises `STOREROOM_LOW`. These appear in the existing alert list and in
+`/api/state` and `/ws` under `inventory`. Raising stock above thresholds resolves
+the alert. Repeated camera readings with the same quantity create no extra event.
+
+Marked shelf camera slots linked to an inventoried SKU update shelf quantity through
+the inventory service. Occluded and misplaced readings are ignored. The existing
+shelf grid and alerts continue to work for products without inventory records.
+
+Start the app with `python storesense.py`, then use these examples in another shell
+(PowerShell):
+
+```powershell
+$base = 'http://localhost:8000/api/inventory'
+$p = Invoke-RestMethod -Method Post -Uri "$base/products" -ContentType 'application/json' -Body '{"sku":"COKE-500","name":"Coca Cola 500ml","shelf_quantity":30,"shelf_capacity":40,"shelf_low_threshold":10,"storeroom_quantity":100,"storeroom_low_threshold":20}'
+$id = $p.id
+Invoke-RestMethod -Method Patch -Uri "$base/products/$id/shelf" -ContentType 'application/json' -Body '{"quantity":7,"source":"camera"}'
+Invoke-RestMethod -Method Patch -Uri "$base/products/$id/storeroom" -ContentType 'application/json' -Body '{"quantity":10,"source":"employee"}'
+Invoke-RestMethod -Method Post -Uri "$base/products/$id/transfer-to-shelf" -ContentType 'application/json' -Body '{"quantity":5,"source":"employee"}'
+Invoke-RestMethod -Uri "$base/status"
+Invoke-RestMethod -Uri 'http://localhost:8000/api/state'
+```
+
+The inventory API also provides `GET /products`, `GET /products/{id}`,
+`PATCH /products/{id}` for name and thresholds, `GET /events`, and
+`GET /products/{id}/events`. All paths above are under `/api/inventory`.
+Run `python scripts/test_inventory.py` for five isolated scenarios without a camera,
+or `python -m unittest discover -s tests -p test_inventory.py -v` for automated tests.
+
+Inventory SQL is isolated in `inventory/database.py`, sharing StoreSense's SQLite
+connection and lock. A future PostgreSQL or MySQL repository can replace it while
+leaving the service, rules, and routes intact; no database migration is performed now.
+
 ### Full demo, no cameras needed
 
 ```bash
@@ -155,6 +193,48 @@ python tests/test_depth.py    # depth counting on a ray-traced shelf from three 
 python tests/test_cams.py     # camera hot-start/stop, phone URL fixing, stream lag, live view
 python tests/test_real.py     # real YOLO on a generated walk-through video
 ```
+
+### USDZ room-model processing (developer preview)
+
+The room-model processor is an independent Python package in `room_model/`.
+It does not change the live dashboard or the existing layout JSON. A future
+upload endpoint can save a file and call the same function:
+
+```python
+from room_model import process_room_model
+
+result = process_room_model(saved_usdz_path)
+# Return result from an API route after the upload handler saves the file.
+```
+
+Install the Python dependencies and **Blender 4.0 or newer**. Blender must be
+available as `blender` on `PATH`, or set `BLENDER_EXECUTABLE` to its executable:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.txt
+$env:BLENDER_EXECUTABLE = "C:\Program Files\Blender Foundation\Blender 4.5\blender.exe"
+.\.venv\Scripts\python scripts/test_room_model.py C:\path\to\room.usdz
+.\.venv\Scripts\python -m unittest discover -s tests -p test_room_model.py
+```
+
+On Linux/macOS, use `python3 -m venv .venv`, `.venv/bin/python -m pip install -r requirements.txt`,
+and either put `blender` on `PATH` or `export BLENDER_EXECUTABLE=/path/to/blender`.
+Run the script with `.venv/bin/python scripts/test_room_model.py /path/to/room.usdz`.
+The override is optional on Windows too: common Blender Foundation install
+folders are searched automatically. The manual script requires an actual,
+non-empty `.usdz` scan. It prints conversion status, OBJ and preview paths,
+vertex and face counts, and dimensions.
+
+Each successful call creates `storage/room_models/<model_id>/model.obj` and
+`preview.png`; generated files are ignored by Git. The returned metadata
+contains the source and output paths, vertex and face counts, axis-aligned
+bounds, dimensions, and bounds center. Values remain in the model's source
+units; no floor, wall, scale calibration, or alignment with the dashboard
+layout is inferred yet. Blender exports triangulated, Z-up geometry without
+UVs or materials. Trimesh combines OBJ objects and instances with their
+transforms. Matplotlib renders a debug PNG from at most 20,000 faces; the
+full OBJ and mesh geometry are unaffected.
 
 ## Status
 
