@@ -1,0 +1,4 @@
+hour_start,date,hour,weekday,entries,exits,bills,revenue,items_sold,avg_inside,avg_queue_wait_min,stock_alerts,demo
+2026-09-30 00:00,2026-09-30,0,2,0,0,0,0.0,0,,,12,0
+2026-09-30 01:00,2026-09-30,1,2,0,0,0,0.0,0,,,21,0
+2026-09-30 15:00,2026-09-30,15,2,18,33,1,50.0,2,,,41,0

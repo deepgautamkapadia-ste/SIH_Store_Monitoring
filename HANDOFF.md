@@ -2,7 +2,7 @@
 
 Everything we have built for **SIH 2026, PS SIH26179** (AI-powered retail intelligence on edge devices, set by Qualcomm). It covers what the product does, how to run it, how the code is laid out, what is tested and what isn't, and what's left to do.
 
-Repo: `github.com/deepgautamkapadia-ste/SIH_Store_Monitoring` · one Python file: `storesense.py` (~4,100 lines)
+Repo: `github.com/deepgautamkapadia-ste/SIH_Store_Monitoring` · one Python file: `storesense.py` (~4,700 lines)
 
 ---
 

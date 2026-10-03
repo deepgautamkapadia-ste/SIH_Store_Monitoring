@@ -152,6 +152,7 @@ python tests/test_logic.py    # counting, queue, shelf grid, alerts, API, offlin
 python tests/test_layout.py   # store plan geometry, coverage, store-frame mapping, 3D render
 python tests/test_pos.py      # catalog, carts, bills, checkout camera, product boxes, stock counts
 python tests/test_depth.py    # depth counting on a ray-traced shelf from three camera angles
+python tests/test_cams.py     # camera hot-start/stop, phone URL fixing, stream lag, live view
 python tests/test_real.py     # real YOLO on a generated walk-through video
 ```
 
