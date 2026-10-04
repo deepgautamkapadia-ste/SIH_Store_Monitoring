@@ -4453,7 +4453,8 @@ function shSide(){const s=SH.slots.find(x=>x.id===SH.sel);let h='';
     placeholder="e.g. 7" oninput="SHU(this.value)"></div>
    ${s.deep>1&&!s.unit_cm?`<div class="warnbox">⚠ <b>${s.deep} deep, but no unit size.</b> Without it the camera can only see the front pack of each
      column, so a pack taken from the front still shows as full and one put back shows as full again. Enter how deep one pack is.</div>`:''}
-   ${s.deep>1&&s.unit_cm&&SH.cam&&S&&S.depth&&S.depth[SH.cam]&&!S.depth[SH.cam].on?`<div class="warnbox">⚠ <b>Depth counting is off for this camera:</b> ${esc(S.depth[SH.cam].msg)}</div>`:''}
+   ${s.deep>1&&s.unit_cm&&SH.dirty?`<div class="warnbox">⚠ <b>Not saved yet.</b> Press <b>Save products</b> — depth counting only starts once the unit size is saved.</div>`:''}
+   ${s.deep>1&&s.unit_cm&&!SH.dirty&&SH.cam&&S&&S.depth&&S.depth[SH.cam]&&!S.depth[SH.cam].on?`<div class="warnbox">⚠ <b>Depth counting is off for this camera:</b> ${esc(S.depth[SH.cam].msg)}</div>`:''}
    <div class="hint">A full box holds <b id="sh_full">${s.facings*s.deep}</b> units. With the unit size set, the depth model
     measures how far back the front unit of each column sits and counts what's left behind it. Without it, the count is
     an estimate: facings still visible × units deep.</div>
@@ -4490,6 +4491,7 @@ setInterval(()=>{if(TABV==='shelves'&&SH.view==='depth')shImg()},3000);
 function shImgErr(){if(SH.view!=='depth')return;SH.view='live';shImg();
  const d=S&&S.depth&&S.depth[SH.cam];$('shmsg').textContent='No depth picture yet — '+(d&&!d.on?d.msg:'set a unit size on a product box and wait a few seconds')}
 function shDepthLine(){const el=$('shdepth');if(!el)return;const d=S&&S.depth&&S.depth[SH.cam];
+ if(SH.dirty&&SH.slots.some(x=>x.unit_cm>0)){el.innerHTML='Depth model waiting — press <b>Save products</b> to send the unit size to the camera.';return}
  el.innerHTML=!d?'':d.on?`Depth model on — ${esc(d.msg)}${d.noise_cm!=null?` · fit error ${d.noise_cm} cm`:''}`
   :`Depth model off — ${esc(d.msg)}`}
 function shDel(){SH.slots=SH.slots.filter(s=>s.id!==SH.sel);SH.sel=null;shDirty();shSide();shOv()}
