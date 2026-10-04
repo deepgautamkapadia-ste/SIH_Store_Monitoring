@@ -92,6 +92,15 @@ before = dict(engine.footfall)
 walk(3, [100, 110, 120, 110, 100])
 check("no phantom count", engine.footfall == before, str(engine.footfall))
 
+# the door camera gives everyone who comes in a shopper ID, and finds it again on the way out
+check("coming in issues a shopper ID", engine.sh_stats["issued"] == 1 and len(engine.shoppers) == 1,
+      str(engine.sh_stats))
+sid = pw.shopper_of.get(1)
+check("the person is labelled with it on the camera", bool(sid) and sid.startswith("SH-"), str(sid))
+check("going out is matched back to the same shopper", engine.shoppers[sid]["status"] == "left"
+      and pw.shopper_of.get(2) == sid, str(engine.shoppers[sid]["status"]))
+check("a walk that never crosses issues no ID", engine.sh_stats["issued"] == 1)
+
 # ── queue: build up, then drain ───────────────────────────────────────
 print("\nqueue intelligence")
 pw.t_start = time.time() - 120                      # pretend the cam has been up 2 min
@@ -119,6 +128,17 @@ check("wait estimated", q["wait_min"] > 0)
 check("forecast has 5/10/15", set(q["forecast"]) == {"5", "10", "15"})
 check("recommends more counters", q["recommend_counters"] > 1, str(q["recommend_counters"]))
 check("queue alert fired", any(a["kind"] == "queue" for a in engine.snapshot()["alerts"]))
+check("dispersal: 6 in line, arrivals outpace one counter -> says it will not clear", q["clear_min"] is None, str(q["clear_min"]))
+check("...but gives the time it would take with the recommended counters",
+      q["clear_min_if_opened"] is not None and q["clear_min_if_opened"] > 0, str(q["clear_min_if_opened"]))
+check("what-if table covers 1..max counters, waits fall as counters open",
+      [w["counters"] for w in q["what_if"]] == list(range(1, ss.CONFIG["queue"]["max_counters"] + 1))
+      and all(a["wait_min"] > b["wait_min"] for a, b in zip(q["what_if"], q["what_if"][1:])), str(q["what_if"]))
+check("...and flags which counts keep up with arrivals", not q["what_if"][0]["keeps_up"] and q["what_if"][-1]["keeps_up"])
+qa = [a for a in engine.snapshot()["alerts"] if a["kind"] == "queue"][0]
+check("the staff alert says how long until the line is gone", "clears in" in qa["action"] or "not clearing" in qa["message"],
+      f"{qa['message']} | {qa['action']}")
+check("peak queue is tracked for the day", engine.snapshot()["queue_peak"]["len"] >= 6)
 
 for _ in range(3):                                   # everyone leaves
     SCRIPT["boxes"], SCRIPT["ids"] = [], []
@@ -247,6 +267,41 @@ engine.on_queue("entry", {"length": 0, "wait_min": 0.0, "recommend_counters": 1,
 check("queue alert clears when drained",
       not any(a["message"] == "long" for a in engine.snapshot()["alerts"]))
 
+# ── crowds: call staff to the spot, and say when it should thin out ──
+print("\ncrowds")
+ss.CONFIG["crowd"].update(people=6, hold_s=0.4)
+engine.on_crowd("aisle", 3)
+check("a few people are not a crowd", not engine.crowds)
+engine.on_crowd("aisle", 9)
+check("one noisy frame is not a crowd", not engine.crowds and engine.crowd_hist["aisle"][-1][1] == 9)
+for _ in range(8):
+    engine.on_crowd("aisle", 8)
+    time.sleep(0.12)
+check("a steady crowd is recognised", "aisle" in engine.crowds, str(engine.crowds))
+ca = [a for a in engine.snapshot()["alerts"] if a["kind"] == "crowd" and "aisle" in a["action"]]
+check("staff are told where to go", ca and ca[0]["action"].startswith("Send") and "8 people at aisle" in ca[0]["message"],
+      str([(a["message"], a["action"]) for a in engine.snapshot()["alerts"]]))
+cv_ = engine.snapshot()["crowds"][0]
+check("the dashboard gets the crowd, its size and whether staff were alerted",
+      cv_["cam"] == "aisle" and cv_["people"] == 8 and cv_["staff_alert"] and cv_["peak"] >= 8, str(cv_))
+now = time.time()
+engine.crowd_hist["aisle"].clear()                    # a crowd that has been shrinking for two minutes: 10 -> 7
+engine.crowd_hist["aisle"].extend((now - 120 + i * 10, 10 - 3 * i / 12) for i in range(13))
+eta = engine.crowd_eta("aisle", 7, now)
+check("dispersal estimate from the trend", eta is not None and 1.5 < eta < 2.5, str(eta))
+engine.crowd_hist["aisle"].clear()
+engine.crowd_hist["aisle"].extend((now - 120 + i * 10, 8) for i in range(13))
+check("a crowd that isn't thinning gets no made-up time", engine.crowd_eta("aisle", 8, now) is None)
+check("already under the line = 0", engine.crowd_eta("aisle", 3, now) == 0.0)
+engine.crowd_hist["aisle"].clear()
+for _ in range(4):
+    engine.on_crowd("aisle", 2)
+check("crowd ends once it thins out", not engine.crowds)
+check("...its alert goes away", not any(a["kind"] == "crowd" and "aisle" in a["action"] for a in engine.snapshot()["alerts"]))
+ev = store.q("SELECT data FROM events WHERE type='crowd'")
+check("...and the episode is logged with its size and length", ev and json.loads(ev[-1][0])["people"] >= 8, str(ev))
+ss.CONFIG["crowd"].update(people=6, hold_s=8)
+
 # ── api + reports ─────────────────────────────────────────────────────
 print("\napi + reports")
 from fastapi.testclient import TestClient
@@ -254,10 +309,32 @@ from fastapi.testclient import TestClient
 app = ss.make_app(engine, {"entry": pw, "shelfA": sw}, store)
 cl = TestClient(app)
 check("dashboard serves", cl.get("/").status_code == 200 and "StoreSense" in cl.get("/").text)
+page = cl.get("/").text
+check("dashboard has the Queue tab, the 3D heat view and the shopper bar",
+      'data-t="queue"' in page and 'id="h3d"' in page and 'id="v3d"' in page and 'id="shopbar"' in page)
+check("analytics page: KPI cards, highlights, grouped sections",
+      'id="akpis"' in page and 'id="ains"' in page and "Products and shelves" in page and "Checkout and service" in page)
+check("Home heatmap shows only names, no camera lines (cameras are Setup-only)", "cams:false" in page and "o.cams" in page)
+import shutil, subprocess
+if shutil.which("node"):                      # a typo in the dashboard script would blank the whole page
+    js = page.split("<script>")[1].split("</script>")[0]
+    with open("dash_check.js", "w") as fh:
+        fh.write(js)
+    r = subprocess.run(["node", "--check", "dash_check.js"], capture_output=True, text=True)
+    check("dashboard script has no syntax errors", r.returncode == 0, r.stderr[:200])
+    os.remove("dash_check.js")
 st = cl.get("/api/state").json()
 check("/api/state shape", {"footfall", "queues", "shelves", "alerts", "heat"} <= set(st))
 check("POS hook", cl.post("/api/integrations/pos", json={"bill_id": "b1", "items": []}).json()["ok"])
 check("counters endpoint", cl.post("/api/counters?open=3").json()["open_counters"] == 3)
+store.metrics(time.time() - 120, {"queue_len": 4, "queue_wait_min": 2.7, "counters_open": 1})
+store.metrics(time.time() - 60, {"queue_len": 7, "queue_wait_min": 4.1, "counters_open": 2})
+qj = cl.get("/api/queue").json()
+check("queue analytics: today minute by minute", [r["len"] for r in qj["today"]] == [4, 7], str(qj["today"]))
+check("queue analytics: headline figures", qj["stats"]["peak_len"] == 7 and qj["stats"]["peak_wait_min"] == 4.1
+      and qj["stats"]["avg_wait_min"] == 3.4, str(qj["stats"]))
+check("queue analytics: weekday x hour grid and crowd log", len(qj["weekday_hour"]) == 7 and len(qj["weekday_hour"][0]) == 24
+      and qj["crowds"] and qj["crowds"][0]["people"] >= 8)
 check("404 on unknown cam calibrate", cl.post("/api/calibrate/nope").status_code == 404)
 rep = cl.get("/api/report?period=day").json()
 print("   ", json.dumps({k: rep[k] for k in ("footfall_total", "customers_billed", "conversion",

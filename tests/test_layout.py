@@ -118,11 +118,54 @@ store = ss.Store("lay.db")
 eng = ss.Engine(store, again)
 check("store heat allocated", eng.store_heat.shape == (32, 40))
 eng.add_store_heat(5.0, 4.0, 2.0)
-check("dwell lands in the right cell", eng.store_heat[16, 20] == 2.0)
+check("dwell is spread round the feet, none of it lost", near(float(eng.store_heat.sum()), 2.0, 1e-3) and
+      np.unravel_index(eng.store_heat.argmax(), eng.store_heat.shape) == (16, 20))
+check("...so a person warms their neighbours, not one square", int((eng.store_heat > 0.005).sum()) > 9)
 eng.add_store_heat(-1, 4, 1.0)
 eng.add_store_heat(99, 4, 1.0)
-check("outside the store is ignored", float(eng.store_heat.sum()) == 2.0)
+check("outside the store is ignored", near(float(eng.store_heat.sum()), 2.0, 1e-3))
 check("snapshot normalises heat", max(max(r) for r in eng.snapshot()["store_heat"]) == 1.0)
+
+# the "now" layer: shows who is on the floor right now and forgets them again
+live = np.array(eng.snapshot()["store_live"])
+check("someone standing there shows up in the live layer at once", live.max() > 0.05, f"{live.max():.2f}")
+eng.add_store_heat(2.0, 2.0, 12.0)                         # a shopper browsing for 12 s
+live = np.array(eng.snapshot()["store_live"])
+check("a browsing shopper is clearly visible, not drowned by older heat", live[8, 8] > 0.7, f"{live[8, 8]:.2f}")
+day_total, raw = float(eng.store_heat.sum()), float(eng.store_live.max())
+eng.heat_t -= 2 * ss.CONFIG["heat"]["live_tau_s"]          # two time-constants later
+eng.store_live_norm()
+check("the live layer fades as people move on", float(eng.store_live.max()) < 0.2 * raw,
+      f"{raw:.2f} -> {float(eng.store_live.max()):.2f}")
+check("...while today's total keeps everything", near(float(eng.store_heat.sum()), day_total))
+eng.heat_day -= 86400
+eng.add_store_heat(5.0, 4.0, 1.0)
+check("a new trading day starts with a clean floor", near(float(eng.store_heat.sum()), 1.0, 1e-3))
+
+# placing a camera is enough to put its people on the plan (exact mapping needs floor points)
+cam = {"x": 1.0, "y": 2.0, "heading": 0.0, "fov": 90.0, "range": 4.0}
+check("approximate mapping: bottom centre is just ahead of the camera",
+      all(near(a, b, 1e-6) for a, b in zip(ss.approx_store_point(cam, 0.5, 1.0), (1.8, 2.0))))
+check("...top centre is at the camera's range", all(near(a, b, 1e-6) for a, b in zip(ss.approx_store_point(cam, 0.5, 0.0), (5.0, 2.0))))
+check("...right of the picture is the camera's right (down the plan when facing +x)",
+      all(near(a, b, 1e-6) for a, b in zip(ss.approx_store_point(cam, 1.0, 0.0), (5.0, 6.0))))
+turned = ss.approx_store_point({**cam, "heading": 90.0}, 1.0, 0.0)
+check("...and turns with the heading", near(turned[0], -3.0) and near(turned[1], 6.0), str(turned))
+check("outside the picture is nowhere", ss.approx_store_point(cam, 1.2, 0.5) is None)
+
+fake = types.SimpleNamespace(engine=eng, name="c1", storeH=None, _sp_sig=None)
+eng.layout = lay
+lay.save({"store": {"w": 10, "h": 8}, "shelves": [shelf], "cameras": [dict(front)]})
+mp = ss.CamWorker.store_point(fake, 320, 480, 640, 480)
+check("camera without floor points: placed from where it stands, and says so",
+      mp is not None and eng.heat_src.get("c1") == "approx", f"{mp} {eng.heat_src}")
+lay.save({"store": {"w": 10, "h": 8}, "shelves": [shelf], "cameras": [
+    {**front, "floor_quad": [[0, 0], [1, 0], [1, 1], [0, 1]], "floor_rect": {"x": 5, "y": 4, "w": 4, "h": 4, "rot": 0}}]})
+mp = ss.CamWorker.store_point(fake, 320, 240, 640, 480)
+check("camera with its floor points: exact, and says so",
+      eng.heat_src.get("c1") == "exact" and near(mp[0], 5.0, 1e-3) and near(mp[1], 4.0, 1e-3), f"{mp} {eng.heat_src}")
+lay.save({"store": {"w": 10, "h": 8}, "shelves": [shelf], "cameras": [dict(front)]})
+
 check("snapshot carries the layout", eng.snapshot()["layout"]["store"]["w"] == 10)
 
 # two cameras with different floor patches land in one shared frame

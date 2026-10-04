@@ -85,7 +85,7 @@ check("privacy: no frames in db",
 check("privacy: only ids/counts stored",
       all(set(__import__("json").loads(d)) <= {"dir", "zone", "duration_s", "id", "kind", "response_s",
                                                "ts", "severity", "priority", "message", "action",
-                                               "acked", "count"}
+                                               "acked", "count", "shopper", "billed", "again", "people", "where"}
           for (d,) in store.q("SELECT data FROM events")))
 
 # same person walking back = one exit
