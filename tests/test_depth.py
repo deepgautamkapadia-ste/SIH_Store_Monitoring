@@ -201,6 +201,51 @@ check("says why depth is off", not sw.depth_state["on"] and "pip install transfo
       sw.depth_state["msg"])
 check("snapshot carries depth status", eng.snapshot()["depth"]["shelfD"]["on"] is False)
 
+# ── a box with ONE column: needs depth to see behind the front pack ────────────────
+# (it used to fall back to the front row: take a pack out and it still said 3/3, take them all and it said 0/3,
+# put one back and it said 3/3 again — the plane through the shelf front needs more than one column to be found)
+print("\none facing, three packs deep")
+SAVED = list(shelf3d.PRODUCTS)
+shelf3d.PRODUCTS[:] = [("snack", 0.00, 0.090, 0.080, 0.20, 1, 3, (200, 60, 160), -0.04)]
+ss.DEPTH.update(fn=fake_depth, err=None, tried=True, name="stand-in")
+for vname, view in VIEWS.items():
+    print(f"  {vname}")
+    eng, sw, slots = setup(view)
+    full_img = frame(None, **view)
+    sw.calib_request = True
+    sw.step(full_img)
+    run(sw, eng, full_img, 5)
+
+    def snack(rem):
+        return run(sw, eng, frame(rem, **view), 4)["snack"]
+    c = snack(None)
+    check("depth is used, not the front-row guess", c["method"] == "depth", f"{c['method']} / {sw.depth_state['msg']}")
+    check("full: 3 of 3", c["est_units"] == 3 and c["status"] == "OK")
+    for taken, want in ((1, 2), (2, 1), (3, 0)):
+        c = snack({("snack", 0): taken})
+        check(f"{taken} taken -> {want} left", c["est_units"] == want and c["est_min"] == want,
+              f"est {c['est_units']} min {c['est_min']}")
+    check("all taken -> EMPTY", c["status"] == "EMPTY")
+    for put, truth in (({1, 2}, 1), ({2}, 2)):
+        snack({("snack", 0): 3})                      # emptied, then someone puts packs back at the front
+        c = snack({("snack", 0): put})
+        lo, hi = c["est_min"], c["est_units"]
+        check(f"{truth} put back at the front: the true count is within what is reported", lo <= truth <= hi,
+              f"{lo}-{hi}")
+        check("...and a count is only called exact when it is", not c["exact"] or lo == hi == truth,
+              f"exact={c['exact']} {lo}-{hi}")
+        check("...never claims a full shelf when only the front pack is certain", lo < 3, f"{lo}-{hi}")
+        if put == {1, 2}:
+            check("one pack at the front is not OK: stock status follows what is certain", c["status"] == "LOW",
+                  c["status"])
+            if vname.startswith("from the side"):
+                check("seen from the side the top/side of the packs behind show it: exactly 1", lo == hi == 1 and c["exact"],
+                      f"{lo}-{hi}")
+            sw.refilled("snack")
+            c = snack({("snack", 0): put})
+            check("staff saying it was refilled clears the doubt", c["est_min"] == c["est_units"], f"{c['est_min']}-{c['est_units']}")
+shelf3d.PRODUCTS[:] = SAVED
+
 print("\nAPI")
 ss.DEPTH.update(fn=fake_depth, err=None, tried=True)
 eng, sw, slots = setup({})
@@ -215,6 +260,12 @@ r = cli.get("/api/slots/shelfD")
 check("unit size saved on the product box", r.json()["slots"][0]["unit_cm"] == 8.0, str(r.json()["slots"][0]))
 page = cli.get("/").text
 check("dashboard has depth controls", "b_depth" in page and "one unit, front to back" in page)
+check("dashboard warns when a deep box has no unit size", "deep, but no unit size" in page)
+check("dashboard shows a count range and a refilled link", "at least ${c.est_min} for sure" in page and "function cnt(" in page)
+sw.ledger[("cola", 0)] = {"j": 0, "lo": 1}
+check("refilled endpoint clears the doubt for that box", cli.post("/api/shelf/shelfD/refilled", json={"slot": "cola"}).json()["ok"]
+      and ("cola", 0) not in sw.ledger)
+check("refilled on a non-shelf camera is refused", cli.post("/api/shelf/nope/refilled", json={"slot": "cola"}).status_code == 404)
 with open("depth_view_test.jpg", "wb") as fh:
     fh.write(cli.get("/api/depth/shelfD.jpg").content)
 

@@ -155,6 +155,17 @@ check("slots survive save/normalise", len(lay.cam("shelfP")["slots"]) == 3 and
       lay.cam("shelfP")["slots"][0]["deep"] == 3)
 sw = ss.ShelfWorker("shelfP", {"shelf"}, "dummy_pos.mp4", eng)
 
+# someone browsing in front of a shelf camera appears on the floor heatmap
+PERSONS[:] = [[300, 120, 360, 470]]
+sw.step(np.zeros((480, 640, 3), np.uint8))
+time.sleep(0.3)
+total0 = float(eng.store_heat.sum())
+sw.step(np.zeros((480, 640, 3), np.uint8))
+check("a shopper at the shelf warms the floor map", float(eng.store_heat.sum()) > total0 and
+      float(eng.store_live.max()) > 0, f"{total0} -> {float(eng.store_heat.sum())}")
+check("...and the dashboard is told the positions are estimates", eng.snapshot()["heat_src"].get("shelfP") == "approx")
+PERSONS[:] = []
+
 
 def shelf(missing=(), swapped=()):
     """Each facing is a boxy product with strong edges; missing ones are bare shelf; swapped ones hold a
@@ -274,6 +285,108 @@ last = [json.loads(d) for (d,) in store.q("SELECT data FROM events WHERE type='p
 last = [d for d in last if d["slot"] == "b"][-1]
 check("stop logged for analytics", last["slot"] == "b" and 2.5 <= last["s"] <= 3.5, str(last))
 
+# ── shoppers: an ID at the door, checked again at the till ───────────
+print("\nshoppers")
+import re
+
+
+def person(shirt, trousers, box=(250, 60, 390, 440)):
+    """A flat picture of someone: shirt colour on top, trousers below (BGR)."""
+    img = np.full((480, 640, 3), 140, np.uint8)
+    x1, y1, x2, y2 = box
+    img[y1:y1 + 190, x1:x2] = shirt
+    img[y1 + 190:y2, x1:x2] = trousers
+    return img, list(box)
+
+
+RED, NAVY, BLUE, TAN, GREEN, WHITE = (40, 40, 200), (90, 40, 30), (200, 90, 30), (110, 160, 200), (60, 170, 60), (235, 235, 235)
+(imA, bA), (imB, bB), (imC, bC) = person(RED, NAVY), person(BLUE, TAN), person(GREEN, WHITE)
+sA, sB, sC = (ss.body_signature(im, b) for im, b in ((imA, bA), (imB, bB), (imC, bC)))
+check("signature is numbers only", sA.shape == (3, 15) and sA.dtype == np.float32 and abs(float(sA.sum()) - 3) < 1e-3)
+check("same clothes match, different clothes don't", ss.sig_similarity(sA, sA) > 0.99 and ss.sig_similarity(sA, sB) < 0.5,
+      f"{ss.sig_similarity(sA, sA):.2f} vs {ss.sig_similarity(sA, sB):.2f}")
+check("the head is not part of the signature", np.allclose(
+    ss.body_signature(imA, bA), ss.body_signature(np.where(np.arange(480)[:, None, None] < 100, 20, imA).astype(np.uint8), bA)))
+check("a tiny or cut-off person gives no signature", ss.body_signature(imA, [10, 10, 20, 30]) is None)
+
+ss.CONFIG["shopper"]["require_id"] = False
+ida = eng.on_entry("entry", "in", sig=sA, tid=1)
+idb = eng.on_entry("entry", "in", sig=sB, tid=2)
+check("everyone who comes in gets a unique ID", re.fullmatch(r"SH-\d{6}-\d{3}", ida or "") and idb and ida != idb, f"{ida} {idb}")
+check("a repeat crossing doesn't issue a second ID", eng.on_entry("entry", "in", sig=sA, tid=1) == ida)
+sv = eng.shopper_view()
+check("both are inside", sv["inside"] == 2 and {x["id"] for x in sv["list"]} == {ida, idb}, str(sv))
+check("only numbers are kept: no picture, JSON-safe", json.dumps(sv) and all(
+    not isinstance(v, np.ndarray) or v.shape == (3, 15) for sh in eng.shoppers.values() for v in sh.values()))
+dim = np.clip(imA.astype(int) * 0.85, 0, 255).astype(np.uint8)          # same person, other camera, dimmer
+check("the till finds the same shopper again", eng.identify(ss.body_signature(dim, bA))[0] == ida)
+check("a stranger matches nobody", eng.identify(sC)[0] is None)
+twin = eng.on_entry("entry", "in", sig=sA, tid=3)
+check("two people dressed alike are never guessed between", eng.identify(sA)[0] is None and twin != ida)
+eng.on_entry("entry", "out", sig=None, tid=3)                              # the twin goes back out
+eng.shoppers.pop(twin, None)
+
+# the till camera: needs the same match twice in a row before it is trusted
+PERSONS[:] = [bB]
+for _ in range(2):
+    cw.step(imB)
+check("one sighting at the till isn't enough", eng.till_current() is None, str(eng.till))
+for _ in range(6):
+    cw.step(imB)
+t = eng.till_current()
+check("till camera identifies the shopper", t and t["id"] == idb and t["score"] > 0.9, str(t))
+check("...and the snapshot shows it", eng.snapshot()["shoppers"]["till"]["id"] == idb)
+PERSONS[:] = []
+
+cid = eng.cart_new()
+eng.cart_add(cid, "dove-sh")
+bill, err = eng.checkout(cid)
+check("bill is made for the shopper the camera found", bill["shopper"]["id"] == idb and bill["shopper"]["how"] == "camera"
+      and bill["shopper"]["check"] == "ok", str(bill["shopper"]))
+check("the shopper is marked billed", eng.shoppers[idb]["status"] == "billed" and eng.shoppers[idb]["bills"] == [bill["id"]])
+check("bill remembers who it was for", store.bill_get(bill["id"])["shopper"]["id"] == idb)
+check("ID is printed on the bill", cv2.imdecode(np.frombuffer(ss.render_bill(bill)[0], np.uint8), 1) is not None)
+
+eng.till = None
+cid = eng.cart_new()
+eng.cart_add(cid, "dove-sh")
+check("a made-up ID is refused", "No shopper" in (eng.cart_shopper(cid, "SH-000000-999") or ""))
+check("staff can pick the shopper", eng.cart_shopper(cid, ida.lower()) is None and eng.cart_view(cid)["shopper"] == ida)
+bill, err = eng.checkout(cid)
+check("manual pick is recorded as such", bill["shopper"] == {"id": ida, "how": "manual", "check": "ok"}, str(bill["shopper"]))
+
+cid = eng.cart_new()
+eng.cart_add(cid, "dove-sh")
+n_alerts = len([a for a in eng.snapshot()["alerts"] if a["action"] == "Check the shopper ID"])
+bill, err = eng.checkout(cid)
+check("no ID identified: bill still prints but is flagged", bill and bill["shopper"] is None and eng.sh_stats["unverified"] == 1)
+check("...and staff are told", any(a["action"] == "Check the shopper ID" for a in eng.snapshot()["alerts"]))
+
+ss.CONFIG["shopper"]["require_id"] = True
+cid = eng.cart_new()
+eng.cart_add(cid, "dove-sh")
+bill, err = eng.checkout(cid)
+check("with require_id, no verified ID = no bill", bill is None and "Shopper ID not verified" in err, str(err))
+check("...cart is kept so staff can pick one", eng.cart_view(cid) is not None)
+check("naming an ID at checkout verifies it", eng.checkout(cid, idb)[0] is not None)
+ss.CONFIG["shopper"]["require_id"] = False
+
+check("leaving by track gives back the same ID", eng.on_entry("entry", "out", sig=None, tid=1) == ida)
+check("a shopper who has left can't be picked", "already left" in (eng.cart_shopper(eng.cart_new(), ida) or ""))
+unbilled0 = eng.sh_stats["left_unbilled"]       # the dressed-alike twin walked out above, with no bill
+check("a shopper who was billed leaving isn't counted as unbilled", True)
+check("leaving by clothing finds the right person", eng.on_entry("entry", "out", sig=ss.body_signature(imB, bB), tid=77) == idb)
+check("signature dropped once they leave", eng.shoppers[idb]["sig"] is None and eng.shopper_view()["inside"] == 0)
+idc = eng.on_entry("entry", "in", sig=sC, tid=5)
+eng.on_entry("entry", "out", sig=None, tid=5)
+check("walking out without a bill is counted", eng.sh_stats["left_unbilled"] == unbilled0 + 1 and idc not in {x["id"] for x in eng.shopper_view()["list"]})
+idd = eng.on_entry("entry", "in", sig=sC, tid=5)
+check("stepping out and straight back in keeps the ID", idd == idc and eng.shoppers[idc]["status"] == "inside")
+check("IDs survive in the event log", store.q("SELECT COUNT(*) FROM events WHERE type='shopper_in'")[0][0] >= 3)
+eng.shoppers.clear()
+eng.sh_stats = {"issued": 0, "left_unbilled": 0, "unverified": 0}
+eng.resolve("checkout:unverified")
+
 # ── API ───────────────────────────────────────────────────────────────
 print("\napi")
 from fastapi.testclient import TestClient
@@ -301,6 +414,16 @@ ok = cl.post("/api/slots/shelfP", json={"slots": slots[:2]}).json()
 check("slots API saves", ok["ok"] and len(lay.cam("shelfP")["slots"]) == 2)
 check("reference still served", cl.get("/api/shelf/shelfP/still.jpg").content[:2] == b"\xff\xd8")
 check("snapshot carries POS state", "pos" in eng.snapshot())
+ids = eng.on_entry("entry", "in", sig=sA, tid=41)
+check("shoppers API lists who is inside", [x["id"] for x in cl.get("/api/shoppers").json()["list"]] == [ids])
+c = cl.post("/api/cart").json()
+cl.post(f"/api/cart/{c['id']}/scan", json={"code": "coke"})
+check("shopper API refuses an unknown ID", not cl.post(f"/api/cart/{c['id']}/shopper", json={"shopper": "SH-1"}).json()["ok"])
+check("shopper API attaches an ID", cl.post(f"/api/cart/{c['id']}/shopper", json={"shopper": ids}).json()["cart"]["shopper"] == ids)
+bj = cl.post(f"/api/cart/{c['id']}/checkout", json={}).json()
+check("checkout via API carries the shopper", bj["ok"] and bj["bill"]["shopper"]["id"] == ids)
+eng.shoppers.clear()
+eng.sh_stats = {"issued": 0, "left_unbilled": 0, "unverified": 0}
 
 # ── integrations ─────────────────────────────────────────────────────
 print("\nintegrations")

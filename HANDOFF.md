@@ -59,15 +59,16 @@ Command-line alternative: `python storesense.py --cam entry entry,queue 192.168.
 
 ---
 
-## 3. The dashboard (six tabs)
+## 3. The dashboard (seven tabs)
 
 | Tab | What's there |
 |---|---|
-| **Home** | Live KPIs (inside now, entries, sales today, conversion, queue wait), prioritised alerts with actions, products running low, floor heatmap, footfall by hour |
+| **Home** | Live KPIs (inside now, entries, sales today, conversion, queue wait), prioritised alerts with actions, products running low, footfall by hour, and a medium 3D store model with a live floor heatmap (Now / Today; names only, no camera lines) |
 | **Shelves** | Pick a shelf camera → **Calibrate** (shelf full, aisle clear) → **Draw product box** → choose or create the product (SKU, barcode, brand, MRP, price) → set facings (side by side), units deep and **unit size in cm** (turns on depth counting) → **Save products**. **Still / Live / Depth** picture views. Live stock table (camera count, till count, status, time to empty). Product catalog with printable barcode labels |
-| **Checkout** | Cart built from the checkout camera, a USB scanner (types into the box), or typing a SKU or name. Quantities, savings vs MRP. **Make bill** → PNG and PDF: "please move to the payment counter" |
+| **Checkout** | Cart built from the checkout camera, a USB scanner (types into the box), or typing a SKU or name. Quantities, savings vs MRP. **Make bill** → PNG and PDF: "please move to the payment counter". Shows the shopper ID at the till (camera match or staff pick) and prints it on the bill |
+| **Queue** | Time for the line to clear and what-if for 1–4 counters, crowd hotspots with a dispersal estimate, staff calls, today's queue by the minute, weekday × hour build-up |
 | **CCTV** | Every camera as a plain security view (people boxes, count, timestamp, blurred heads) or with analytics overlays |
-| **Analytics** | Footfall and bills per day, conversion, weekday × hour heatmap, revenue by hour, top products, stock-outs, basket sizes, queue waits. Every chart has a table view. CSV downloads |
+| **Analytics** | KPI cards with trend vs the earlier half, highlights, a live strip, then traffic and sales, products and shelves, checkout and service (incl. shopper-ID tallies). Every chart has a table view. CSV downloads |
 | **Setup** | Store plan in metres: drag shelves and cameras, set lens angle and range, see coverage and blind spots, 3D view. Per camera: source, job, live status, and click-to-place the entry line, queue area and 4 floor points |
 
 Theme: black / red / grey (Snapdragon red; Qualcomm's corporate colour is blue).
@@ -104,7 +105,8 @@ The problem: one camera sees only the front unit of each column. Take that unit 
 2. The reference is back-projected to 3D points using the camera's lens angle from the plan. A plane is fitted through the product fronts, and each column's front face becomes a patch on it: the mouth of that column's **tube**.
 3. Every few seconds a new depth pass is **re-anchored** to the reference, using a trimmed least-squares fit on the parts that shouldn't change (shelf frame, walls). A monocular model's scale drifts a few percent between frames, which at 1.5 m is a whole unit, so this step is essential.
 4. For each column: find the **nearest dense surface** inside its tube, ignoring the smeared "flying pixels" at the rim of a gap. Distance behind the full front ÷ unit size = units gone. Median of the last 3 passes.
-5. **Hidden columns:** at an angle, the neighbours can hide a deep gap. Then the column is reported hidden: the front unit is known to be gone, and the rest isn't guessed. On the Depth view these show as "?".
+5. **Behind the front pack:** from above or the side, the tops/sides of packs behind the front one show; pixels that showed them on the full shelf and have moved away mean those packs are gone. A pack put back at the front from straight on looks like a full stack, so the count comes with a lower bound (`est_min`, `exact`) instead of a guess; **refilled** (Shelves tab) resets it. A box with one column works too (the shelf-front plane is fitted through every box on the camera).
+6. **Hidden columns:** at an angle, the neighbours can hide a deep gap. Then the column is reported hidden: the front unit is known to be gone, and the rest isn't guessed. On the Depth view these show as "?".
 
 Why 3D and not just "how far back is the middle of the box": parallax. A unit that's pushed back slides sideways in the picture into the neighbouring column's area. The first version got this wrong, and the 3D-tube version fixed it.
 

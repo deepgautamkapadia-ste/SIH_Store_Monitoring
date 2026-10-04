@@ -3,6 +3,7 @@
 Renders a colour picture and the exact per-pixel distance (metres along the camera's view axis)
 of a shelf with products stacked several units deep, seen from any camera position and angle.
 Taking units from the front of a column leaves the rest where they were — further back.
+`removed[(product, facing)]` may also be a set of empty positions, to model a pack put back at the front.
 """
 import math
 
@@ -40,7 +41,12 @@ def boxes(removed):
     for pid, top, w, d, h, n, deep, col, x0 in PRODUCTS:
         for i in range(n):
             gone = removed.get((pid, i), 0)
-            for k in range(gone, deep):
+            # an int: that many units gone from the front; a set: exactly those positions (0 = front) are empty,
+            # e.g. {1, 2, 3} is one pack put back at the very front with nothing behind it
+            omit = set(gone) if isinstance(gone, (set, frozenset)) else set(range(gone))
+            for k in range(deep):
+                if k in omit:
+                    continue
                 lo = np.array([x0 + i * (w + 0.006), top - h, ZF + 0.005 + k * d])
                 hi = lo + np.array([w, h, d - 0.004])
                 out.append((lo, hi, col, "product"))

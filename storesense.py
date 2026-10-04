@@ -94,11 +94,22 @@ CONFIG = {
             "calib_passes": 3,      # depth passes averaged into the full-shelf reference after Calibrate
         },
     },
+    "crowd": {                      # a crowd = this many people in one camera's view, steady for a few seconds
+        "people": 6, "hold_s": 8,
+        "clear_ratio": 0.7,         # over once the count drops to this share of the threshold
+        "trend_window_s": 150,      # how far back the "when will it thin out" estimate looks
+    },
     "queue": {
         "open_counters": 1, "max_counters": 4,
         "default_service_per_min": 1.5,   # prior per counter, learned online
         "target_wait_min": 3.0, "max_wait_min": 6.0,
         "min_time_in_zone_s": 4.0, "rate_window_min": 5.0,
+    },
+    "shopper": {                    # everyone who walks in gets an anonymous ID, checked again at the till
+        "require_id": False,        # True: a bill can't be made until the shopper's ID is verified
+        "match_min": 0.55,          # a camera match needs at least this clothing-colour similarity...
+        "match_margin": 0.04,       # ...and has to beat the runner-up by this much
+        "keep_h": 12,               # hours a shopper who has left stays in the list
     },
     "store_name": "StoreSense Mart", # printed on bills
     "bills_dir": "bills",           # PNG + PDF of every bill
@@ -106,6 +117,8 @@ CONFIG = {
     "pos": {"rescan_s": 2.0},       # an item must leave the checkout camera's view this long to count again
     "layout_path": "layout.json",   # the store model: shelves and cameras in metres
     "store_cell_m": 0.25,           # floor-heatmap resolution in the store frame
+    "heat": {"spread_m": 0.35,      # a person warms the floor around their feet, not one square
+             "live_tau_s": 45},     # the "now" heatmap forgets a visit after about this long
     # POS / inventory / ERP systems told about what happens, as JSON POSTs. A plain URL gets every
     # event; {"url": ..., "events": ["alert", "bill", "stock", "restock"]} picks some. Queued in
     # SQLite and retried, so nothing is lost while the store is offline.
@@ -617,7 +630,7 @@ def render_bill(bill):
     from PIL import Image, ImageDraw
     W, pad = 620, 28
     rows = len(bill["lines"])
-    H = 430 + rows * 44
+    H = 460 + rows * 44
     img = Image.new("RGB", (W, H), "white")
     d = ImageDraw.Draw(img)
     f, fb, fs, ft = _font(17), _font(17, True), _font(14), _font(26, True)
@@ -630,6 +643,12 @@ def render_bill(bill):
     d.text((pad, y), f"Bill {bill['id']}", font=fb, fill="black")
     d.text((W - pad, y), when, font=f, fill="black", anchor="ra")
     y += 34
+    sh = bill.get("shopper")
+    if sh:
+        d.text((pad, y - 4), f"Shopper {sh['id']}", font=fs, fill="#444")
+        d.text((W - pad, y - 4), "ID verified" if sh.get("check", "ok") == "ok" else f"ID check: {sh['check']}",
+               font=fs, fill="#444", anchor="ra")
+        y += 24
     d.line([pad, y, W - pad, y], fill="black", width=2)
     y += 10
     cols = [pad, 330, 400, W - pad]
@@ -691,6 +710,10 @@ class Store:
                     total REAL, n_items INTEGER, demo INTEGER DEFAULT 0);
                 CREATE INDEX IF NOT EXISTS ix_bill ON bills(ts);
             """)
+            cols = [r[1] for r in self.db.execute("PRAGMA table_info(bills)")]
+            for c in ("shopper_id", "shopper_how"):     # which shopper the bill was made for, and how it was checked
+                if c not in cols:
+                    self.db.execute(f"ALTER TABLE bills ADD COLUMN {c} TEXT")
             for tbl in ("events", "metrics"):           # rows made by --demo-history are tagged, never mixed silently
                 cols = [r[1] for r in self.db.execute(f"PRAGMA table_info({tbl})")]
                 if "demo" not in cols:
@@ -754,17 +777,20 @@ class Store:
 
     def bill_save(self, b, demo=0):
         with self.lock:
-            self.db.execute("INSERT INTO bills VALUES(?,?,?,?,?,?,?)",
-                            (b["id"], b["ts"], json.dumps(b["lines"]), b["mrp_total"], b["total"], b["n_items"], demo))
+            sh = b.get("shopper") or {}
+            self.db.execute("INSERT INTO bills(id,ts,items,mrp_total,total,n_items,demo,shopper_id,shopper_how) "
+                            "VALUES(?,?,?,?,?,?,?,?,?)",
+                            (b["id"], b["ts"], json.dumps(b["lines"]), b["mrp_total"], b["total"], b["n_items"], demo,
+                             sh.get("id"), sh.get("how")))
             self.db.commit()
 
     def bill_get(self, bid):
-        r = self.q("SELECT id,ts,items,mrp_total,total,n_items FROM bills WHERE id=?", bid)
+        r = self.q("SELECT id,ts,items,mrp_total,total,n_items,shopper_id,shopper_how FROM bills WHERE id=?", bid)
         if not r:
             return None
-        i, ts, items, mrp, tot, n = r[0]
+        i, ts, items, mrp, tot, n, sid, how = r[0]
         return {"id": i, "ts": ts, "lines": json.loads(items), "mrp_total": mrp, "total": tot, "n_items": n,
-                "savings": round(mrp - tot, 2)}
+                "savings": round(mrp - tot, 2), "shopper": {"id": sid, "how": how} if sid else None}
 
     def q(self, sql, *args):
         with self.lock:
@@ -801,7 +827,7 @@ class Store:
 
     def metrics(self, ts, d):
         with self.lock:
-            self.db.executemany("INSERT INTO metrics VALUES(?,?,?)", [(ts, k, float(v)) for k, v in d.items()])
+            self.db.executemany("INSERT INTO metrics(ts,key,value) VALUES(?,?,?)", [(ts, k, float(v)) for k, v in d.items()])
             self.db.commit()
 
     def outbox_add(self, payload):
@@ -873,7 +899,9 @@ class Engine:
         self.store, self.lock = store, threading.RLock()
         self.layout = layout
         # one floor heatmap for the whole store, in metres — every camera feeds the same grid
-        self.store_heat = np.zeros(layout.grid_dims(), np.float32) if layout else None
+        self.store_heat = np.zeros(layout.grid_dims(), np.float32) if layout else None   # dwell today, seconds
+        self.store_live = np.zeros_like(self.store_heat) if layout else None            # who is where lately (fades)
+        self.heat_t, self.heat_day, self.heat_src, self._kern = time.time(), day_start(), {}, None
         self.footfall = {"in": 0, "out": 0}
         self.hourly, self.conversion, self.avg_response_s = {}, None, None
         self.alerts, self.last, self.keys, self.next_id = deque(maxlen=300), {}, {}, 1
@@ -890,6 +918,10 @@ class Engine:
         self.served = deque(maxlen=200)
         self.open_counters = CONFIG["queue"]["open_counters"]
         self.online = None
+        self.crowds, self.crowd_pending, self.crowd_hist = {}, {}, defaultdict(lambda: deque(maxlen=900))
+        self.queue_peak = {"day": day_start(), "len": 0, "wait": 0.0}
+        self.shoppers, self.track_shopper = {}, {}      # id -> record; (camera, track id) -> id
+        self.till, self.sh_stats = None, {"issued": 0, "left_unbilled": 0, "unverified": 0}
         self.refresh_daily()
         from inventory.service import InventoryService
         self.inventory = InventoryService(store, self)
@@ -979,7 +1011,8 @@ class Engine:
             total += amt
             n += qty
         return {"id": cid, "lines": lines, "n_items": n, "mrp_total": round(mrp_total, 2),
-                "total": round(total, 2), "savings": round(mrp_total - total, 2)}
+                "total": round(total, 2), "savings": round(mrp_total - total, 2),
+                "shopper": (self.carts.get(cid) or {}).get("shopper")}
 
     def cart_add(self, cid, code, qty=1, source="manual"):
         p = self.store.product_by_code(code)
@@ -1015,12 +1048,16 @@ class Engine:
         cid = self.active_cart if self.active_cart in self.carts else self.cart_new()
         return self.cart_add(cid, code, 1, source)
 
-    def checkout(self, cid):
+    def checkout(self, cid, shopper=None):
         v = self.cart_view(cid)
         if not v or not v["lines"]:
             return None, "Cart is empty"
+        who = self.verify_shopper(cid, shopper)
+        if CONFIG["shopper"]["require_id"] and not (who and who["check"] == "ok"):
+            why = f" ({who['check']})" if who else ""
+            return None, f"Shopper ID not verified{why} — pick the shopper at the till first"
         ts = time.time()
-        bill = {**v, "id": self.store.next_bill_no(ts), "ts": ts}
+        bill = {**v, "id": self.store.next_bill_no(ts), "ts": ts, "shopper": who}
         self.store.bill_save(bill)
         png, pdf = render_bill(bill)
         os.makedirs(CONFIG["bills_dir"], exist_ok=True)
@@ -1029,7 +1066,20 @@ class Engine:
                 fh.write(data)
         items = [{"sku": ln["sku"], "qty": ln["qty"], "amount": ln["amount"]} for ln in bill["lines"]]
         self.store.event("pos", "pos", {"bill": bill["id"], "items": items, "total": bill["total"],
-                                        "n_items": bill["n_items"]})
+                                        "n_items": bill["n_items"], "shopper": (who or {}).get("id")})
+        if who and who["check"] == "ok":
+            with self.lock:
+                sh = self.shoppers.get(who["id"])
+                if sh:
+                    sh["bills"].append(bill["id"])
+                    sh["status"] = "billed"
+        elif self.shoppers or self.sh_stats["issued"]:     # entry IDs are in use, yet nobody checked out against one
+            with self.lock:
+                self.sh_stats["unverified"] += 1
+            self.store.event("pos", "unverified_checkout", {"bill": bill["id"], "why": (who or {}).get("check", "no shopper identified")})
+            self.fire("checkout:unverified", "checkout", 1,
+                      f"Bill {bill['id']} was made without a verified shopper ID" +
+                      (f" ({who['id']}: {who['check']})" if who else ""), "Check the shopper ID")
         self.on_pos({"items": items})
         self.refresh_daily()
         self.emit("bill", bill)
@@ -1069,18 +1119,144 @@ class Engine:
         return False
 
     # events from workers
-    def on_entry(self, cam, direction):
+    def on_entry(self, cam, direction, sig=None, tid=None):
+        """Someone crossed the entry line. Coming in they are given a shopper ID (returned); going out
+        their ID is found from the track or, failing that, from their clothing signature."""
         with self.lock:
             self.footfall[direction] += 1
             if direction == "in":
                 hh = datetime.now().strftime("%H")
                 self.hourly[hh] = self.hourly.get(hh, 0) + 1
+                sid = self.shopper_enter(cam, tid, sig)
+            else:
+                sid = self.shopper_leave(cam, tid, sig)
             inside = max(0, self.footfall["in"] - self.footfall["out"])
-        self.store.event(cam, "entry", {"dir": direction})
+        self.store.event(cam, "entry", {"dir": direction, **({"shopper": sid} if sid else {})})
         if inside > CONFIG["crowd_threshold"]:
             self.fire("crowd", "crowd", 2, f"{inside} shoppers inside", "Deploy floor staff")
         else:
             self.resolve("crowd")
+        return sid
+
+    # ── shoppers: an anonymous ID for everyone who walks in, checked again at the till ──
+    # Only a number and a clothing-colour histogram are kept (in memory, dropped when the shopper
+    # leaves). No face, no picture. A camera match at the till is a hint staff can overrule by hand.
+    def shopper_enter(self, cam, tid, sig):
+        now = time.time()
+        sid = self.track_shopper.get((cam, tid)) if tid is not None else None
+        sh = self.shoppers.get(sid) if sid else None
+        if sh and sh["status"] != "left":                 # the line was crossed twice with no exit between
+            return sid
+        if sh and now - (sh["t_out"] or 0) < 90:          # stepped out and straight back in: same shopper
+            sh.update(status="billed" if sh["bills"] else "inside", t_out=None, sig=sig)
+            self.store.event(cam, "shopper_in", {"id": sid, "again": True})
+            return sid
+        day = datetime.now().strftime("%y%m%d")
+        n = self.store.q("SELECT COUNT(*) FROM events WHERE type='shopper_in' AND ts>=? AND data NOT LIKE '%again%'",
+                         day_start())[0][0] + 1
+        sid = f"SH-{day}-{n:03d}"
+        self.shoppers[sid] = {"id": sid, "t_in": now, "t_out": None, "status": "inside", "sig": sig,
+                              "cam": cam, "bills": []}
+        if tid is not None:
+            self.track_shopper[(cam, tid)] = sid
+        self.sh_stats["issued"] += 1
+        self.store.event(cam, "shopper_in", {"id": sid})
+        return sid
+
+    def shopper_leave(self, cam, tid, sig):
+        sid = self.track_shopper.get((cam, tid)) if tid is not None else None
+        if not (sid and self.shoppers.get(sid, {}).get("status") in ("inside", "billed")):
+            sid = self.identify(sig)[0] if sig is not None else None
+        sh = self.shoppers.get(sid) if sid else None
+        if sh is None:
+            return None
+        sh.update(status="left", t_out=time.time(), sig=None)
+        if not sh["bills"]:
+            self.sh_stats["left_unbilled"] += 1
+        self.store.event(cam, "shopper_out", {"id": sid, "billed": bool(sh["bills"])})
+        horizon = time.time() - CONFIG["shopper"]["keep_h"] * 3600
+        for k in [k for k, v in self.shoppers.items() if v["status"] == "left" and (v["t_out"] or 0) < horizon]:
+            del self.shoppers[k]
+        self.track_shopper = {k: v for k, v in self.track_shopper.items() if v in self.shoppers}
+        return sid
+
+    def identify(self, sig):
+        """(shopper id or None, best similarity, runner-up) among the people inside. A match must be
+        good enough and clearly better than the next one — otherwise it is None, never a guess."""
+        best, bs, second = None, 0.0, 0.0
+        with self.lock:
+            for sid, sh in self.shoppers.items():
+                if sh["status"] == "left" or sh.get("sig") is None:
+                    continue
+                sc = sig_similarity(sig, sh["sig"])
+                if sc > bs:
+                    best, bs, second = sid, sc, bs
+                elif sc > second:
+                    second = sc
+        c = CONFIG["shopper"]
+        if best is None or bs < c["match_min"] or bs - second < c["match_margin"]:
+            return None, bs, second
+        return best, bs, second
+
+    def till_seen(self, cam, sig):
+        """The checkout camera saw someone at the till. The match is only trusted once the same shopper
+        has come up twice in a row, so a passer-by doesn't get a stranger's cart."""
+        if sig is None:
+            return
+        sid, score, _ = self.identify(sig)
+        now = time.time()
+        t = self.till
+        if sid is None:
+            self.till = {"id": None, "score": round(score, 2), "ts": now, "cam": cam, "hits": 0}
+        elif t and t["id"] == sid and now - t["ts"] < 8:
+            self.till = {**t, "score": round(score, 2), "ts": now, "hits": t["hits"] + 1}
+        else:
+            self.till = {"id": sid, "score": round(score, 2), "ts": now, "cam": cam, "hits": 1}
+
+    def till_current(self):
+        t = self.till
+        if t and t["id"] and t["hits"] >= 2 and time.time() - t["ts"] < 8:
+            return dict(t)
+        return None
+
+    def cart_shopper(self, cid, sid):
+        """Staff picks (or types) the shopper a cart belongs to. '' clears it. Returns an error or None."""
+        with self.lock:
+            c = self.carts.get(cid)
+            if not c:
+                return "no such cart"
+            sid = (sid or "").strip().upper()
+            if not sid:
+                c.pop("shopper", None)
+                return None
+            if sid not in self.shoppers:
+                return f"No shopper {sid} entered today"
+            if self.shoppers[sid]["status"] == "left":
+                return f"{sid} has already left the store"
+            c["shopper"] = sid
+        return None
+
+    def verify_shopper(self, cid, given=None):
+        """Who is this checkout for, and does the entry record agree?
+        {"id", "how": manual|camera, "check": "ok" or the reason it isn't} — or None if nobody was identified."""
+        with self.lock:
+            sid = (given or (self.carts.get(cid) or {}).get("shopper") or "").strip().upper()
+            if sid:
+                sh = self.shoppers.get(sid)
+                chk = "ok" if sh and sh["status"] != "left" else ("not entered today" if not sh else "already left")
+                return {"id": sid, "how": "manual", "check": chk}
+            t = self.till_current()
+            if t:
+                return {"id": t["id"], "how": "camera", "check": "ok", "score": t["score"]}
+        return None
+
+    def shopper_view(self):
+        now = time.time()
+        inside = sorted((s for s in self.shoppers.values() if s["status"] != "left"), key=lambda s: -s["t_in"])
+        return {"inside": len(inside), "issued": self.sh_stats["issued"], "left_unbilled": self.sh_stats["left_unbilled"],
+                "unverified": self.sh_stats["unverified"], "till": self.till_current(),
+                "list": [{"id": s["id"], "mins": round((now - s["t_in"]) / 60, 1), "billed": bool(s["bills"])}
+                         for s in inside[:60]]}
 
     def on_zone_visit(self, cam, zone, dur):
         with self.lock:
@@ -1104,14 +1280,22 @@ class Engine:
         with self.lock:
             self.queues[cam] = q
             k = self.open_counters
+            if self.queue_peak["day"] != day_start():
+                self.queue_peak = {"day": day_start(), "len": 0, "wait": 0.0}
+            self.queue_peak["len"] = max(self.queue_peak["len"], q["length"])
+            self.queue_peak["wait"] = max(self.queue_peak["wait"], q["wait_min"])
         opn, bld, cls = f"queue:{cam}:open", f"queue:{cam}:build", f"queue:{cam}:close"
+        gone = (f", clears in ~{q['clear_min']} min" if q.get("clear_min") else
+                ", not clearing at this rate" if q["length"] and q.get("clear_min") is None else "")
         if q["recommend_counters"] > k:
+            more = q.get("clear_min_if_opened")
             self.fire(opn, "queue", 3,
-                      f"{q['length']} in queue, wait ~{q['wait_min']} min, +10 min forecast {q['forecast']['10']['wait']} min",
-                      f"Open {q['recommend_counters'] - k} more counter(s)")
+                      f"{q['length']} in queue, wait ~{q['wait_min']} min{gone}; +10 min forecast {q['forecast']['10']['wait']} min",
+                      f"Open {q['recommend_counters'] - k} more counter(s)" +
+                      (f" — clears in ~{more} min" if more else ""))
             self.resolve(bld, cls)
         elif q["wait_min"] > CONFIG["queue"]["target_wait_min"]:
-            self.fire(bld, "queue", 2, f"Queue building, wait ~{q['wait_min']} min",
+            self.fire(bld, "queue", 2, f"Queue building, wait ~{q['wait_min']} min{gone}",
                       "Keep a standby cashier ready")
             self.resolve(opn, cls)
         elif k > 1 and q["recommend_counters"] < k and q["length"] == 0:
@@ -1119,6 +1303,75 @@ class Engine:
             self.resolve(opn, bld)
         else:
             self.resolve(opn, bld, cls)                  # queue healthy again
+
+    # ── crowds: anywhere a camera sees too many people, call staff and say when it should thin out ──
+    def cam_name(self, cam):
+        c = self.layout.cam(cam) if self.layout else None
+        return (c or {}).get("name") or cam
+
+    def crowd_eta(self, cam, n, now=None):
+        """Minutes until the count falls back under the threshold, from the trend over the last couple of
+        minutes: 0 if it already has, None if it isn't thinning (or there isn't enough to go on yet)."""
+        c, now = CONFIG["crowd"], now or time.time()
+        target = c["people"] * c["clear_ratio"]
+        if n <= target:
+            return 0.0
+        pts = [(t, v) for t, v in self.crowd_hist[cam] if t >= now - c["trend_window_s"]]
+        if len(pts) < 8 or pts[-1][0] - pts[0][0] < 30:
+            return None
+        t = np.array([p[0] for p in pts]) - pts[0][0]
+        slope = float(np.polyfit(t / 60, np.array([p[1] for p in pts], float), 1)[0])    # people per minute
+        if slope > -0.15:
+            return None
+        return round(min(60.0, (n - target) / -slope), 1)
+
+    def on_crowd(self, cam, n):
+        c, now = CONFIG["crowd"], time.time()
+        key, ended = f"crowd:{cam}", None
+        with self.lock:
+            h = self.crowd_hist[cam]
+            h.append((now, n))
+            near = sorted(v for t, v in h if t >= now - 3)
+            now_n = near[len(near) // 2]                    # median of the last few seconds: one bad frame isn't a crowd
+            st = self.crowds.get(cam)
+            if st is None:
+                if now_n >= c["people"]:
+                    t0 = self.crowd_pending.setdefault(cam, now)
+                    if now - t0 >= c["hold_s"]:
+                        st = self.crowds[cam] = {"since": now, "peak": now_n}
+                        self.crowd_pending.pop(cam, None)
+                else:
+                    self.crowd_pending.pop(cam, None)
+            else:
+                st["peak"] = max(st["peak"], now_n)
+                if now_n <= c["people"] * c["clear_ratio"]:
+                    ended = self.crowds.pop(cam)
+                    st = None
+        if ended:                                           # it has thinned out: log it, drop the alert
+            self.store.event(cam, "crowd", {"where": self.cam_name(cam), "people": ended["peak"],
+                                            "duration_s": round(now - ended["since"], 1)})
+            self.resolve(key)
+        if st is None:
+            return
+        where = self.cam_name(cam)
+        eta = self.crowd_eta(cam, now_n, now)
+        staff = int(min(3, max(1, round(now_n / c["people"]))))
+        when = ("thinning — about " + f"{eta} min to go" if eta else "not thinning yet") if eta != 0 else "easing"
+        self.fire(key, "crowd", 3 if now_n >= 1.5 * c["people"] else 2,
+                  f"{now_n} people at {where} — {when}",
+                  f"Send {staff} staff to {where}")
+
+    def crowd_view(self):
+        now = time.time()
+        out = []
+        for cam, st in self.crowds.items():
+            h = [v for t, v in self.crowd_hist[cam] if t >= now - 3]
+            n = sorted(h)[len(h) // 2] if h else 0
+            eta = self.crowd_eta(cam, n, now)
+            alert = any(not a["acked"] and self.keys.get(a["id"]) == f"crowd:{cam}" for a in self.alerts)
+            out.append({"cam": cam, "where": self.cam_name(cam), "people": n, "peak": st["peak"],
+                        "for_s": round(now - st["since"]), "eta_min": eta, "staff_alert": alert})
+        return sorted(out, key=lambda x: -x["people"])
 
     def on_shelf(self, cam, cells):
         with self.lock:
@@ -1218,7 +1471,12 @@ class Engine:
         pos = self.store.q("SELECT COUNT(*) FROM events WHERE type='pos' AND ts>=?", since)[0][0]
         resp = [json.loads(d)["response_s"] for (d,) in self.store.q("SELECT data FROM events WHERE type='ack' AND ts>=?", since)]
         nb, rev = self.store.q("SELECT COUNT(*), COALESCE(SUM(total),0) FROM bills WHERE ts>=? AND demo=0", since)[0]
+        issued = self.store.q("SELECT COUNT(*) FROM events WHERE type='shopper_in' AND ts>=? AND data NOT LIKE '%again%'", since)[0][0]
+        unbilled = sum(1 for (d,) in self.store.q("SELECT data FROM events WHERE type='shopper_out' AND ts>=?", since)
+                       if not json.loads(d).get("billed"))
+        unverified = self.store.q("SELECT COUNT(*) FROM events WHERE type='unverified_checkout' AND ts>=?", since)[0][0]
         with self.lock:
+            self.sh_stats = {"issued": issued, "left_unbilled": unbilled, "unverified": unverified}
             self.bills_today, self.sales_today = nb, round(rev, 2)
             self.footfall = f
             self.hourly = dict(sorted(hourly.items()))
@@ -1246,29 +1504,88 @@ class Engine:
                 "inventory": self.inventory.status(),
                 "labels": dict(self.labels), "cam_face": dict(self.cam_face),
                 "depth": dict(self.depth_info), "depth_model_err": DEPTH["err"],
-                "pos_tracked": len(self.stock),
+                "pos_tracked": len(self.stock), "shoppers": self.shopper_view(),
+                "crowds": self.crowd_view(), "crowd_threshold": CONFIG["crowd"]["people"],
+                "queue_peak": dict(self.queue_peak),
                 "pos": {"active_cart": self.active_cart, "last_scan": self.last_scan},
                 "sales_today": getattr(self, "sales_today", 0), "bills_today": getattr(self, "bills_today", 0),
                 "hour_now": datetime.now().hour,
-                "store_heat": self.store_heat_norm(), "layout": self.layout.data if self.layout else None,
+                "store_heat": self.store_heat_norm(), "store_live": self.store_live_norm(),
+                "heat_src": dict(self.heat_src), "layout": self.layout.data if self.layout else None,
             }
 
     def store_heat_norm(self):
+        """Today's dwell time on the floor, scaled so the busiest spot is 1."""
         h = self.store_heat
         if h is None:
             return None
         m = float(h.max())
         return (h / m if m > 0 else h).round(3).tolist()
 
+    def store_live_norm(self):
+        """Where people have been in the last minute or so (older visits fade out). Scaled so one person
+        standing still for ~10 s is already 1 — a single shopper browsing shows up straight away, instead of
+        being drowned by the day's busiest spot."""
+        h = self.store_live
+        if h is None:
+            return None
+        with self.lock:
+            self.fade_live(time.time())
+            ref = max(float(h.max()), 0.25 * CONFIG["heat"]["live_tau_s"] * self.kernel()[0].max())
+            return (h / ref).round(3).tolist()
+
+    def fade_live(self, now):
+        self.store_live *= math.exp(-max(0.0, now - self.heat_t) / CONFIG["heat"]["live_tau_s"])
+        self.heat_t = now
+
+    def kernel(self):
+        """Gaussian that spreads one second of someone's presence over the cells around their feet."""
+        cell = max(CONFIG["store_cell_m"], 0.05)
+        key = (cell, CONFIG["heat"]["spread_m"])
+        if self._kern is None or self._kern[1] != key:
+            sig = max(CONFIG["heat"]["spread_m"], 0.05) / cell
+            r = max(1, int(math.ceil(3 * sig)))
+            ax = np.arange(-r, r + 1, dtype=np.float32)
+            k = np.exp(-(ax[None, :] ** 2 + ax[:, None] ** 2) / (2 * sig * sig))
+            self._kern = (k / k.sum(), key, r)
+        return self._kern
+
     def add_store_heat(self, mx, my, dt):
-        """Drop dwell seconds onto the store-wide floor grid, in metres."""
+        """Drop dwell seconds onto the store-wide floor grid, in metres: into today's total and into the
+        fading "now" layer."""
         h = self.store_heat
         if h is None:
             return
         cell = max(CONFIG["store_cell_m"], 0.05)
-        r, c = int(my / cell), int(mx / cell)
-        if 0 <= r < h.shape[0] and 0 <= c < h.shape[1]:
-            h[r, c] += dt
+        r0, c0 = int(my / cell), int(mx / cell)
+        if not (0 <= r0 < h.shape[0] and 0 <= c0 < h.shape[1]):
+            return
+        k, _, rad = self.kernel()
+        with self.lock:
+            now = time.time()
+            if day_start(now) != self.heat_day:           # a new trading day starts with a clean floor
+                self.heat_day = day_start(now)
+                h[:] = 0
+            self.fade_live(now)
+            ya, yb = max(0, r0 - rad), min(h.shape[0], r0 + rad + 1)
+            xa, xb = max(0, c0 - rad), min(h.shape[1], c0 + rad + 1)
+            sub = k[ya - (r0 - rad):yb - (r0 - rad), xa - (c0 - rad):xb - (c0 - rad)] * dt
+            h[ya:yb, xa:xb] += sub
+            self.store_live[ya:yb, xa:xb] += sub
+
+
+def approx_store_point(cam, u, v):
+    """Estimate where someone's feet are on the plan from the camera's placement alone. u, v: the foot's
+    position in the picture, 0..1. Sideways angle comes straight from the field of view; distance runs from
+    close to the camera (bottom of the picture) out to its range (top). Returns None outside the cone."""
+    if not (0 <= u <= 1 and 0 <= v <= 1):
+        return None
+    hd, half = math.radians(cam["heading"]), math.radians(cam["fov"]) / 2
+    near = 0.2 * cam["range"]
+    d = near + (cam["range"] - near) * (1 - v)
+    lateral = d * math.tan(half) * (2 * u - 1)
+    return (cam["x"] + d * math.cos(hd) - lateral * math.sin(hd),
+            cam["y"] + d * math.sin(hd) + lateral * math.cos(hd))
 
 
 # ─────────────────────────────── CAMERA WORKERS ───────────────────────────────
@@ -1286,12 +1603,36 @@ class CamWorker(threading.Thread):
         # for the live view: last person boxes (to blur), the overlay of the last processed frame
         self.blur_boxes, self.blur_t, self.cctv_boxes = [], 0.0, []
         self.ov, self._live_key, self._live = None, None, None
+        self.storeH, self._sp_sig = None, None
 
-    def cctv(self, frame, boxes):
+    def store_point(self, fx, fy, w, h, quad=None):
+        """Where on the store plan a person's feet are (metres), or None. Exact when this camera has its four
+        floor points and the floor patch placed on the plan; otherwise estimated from where the camera sits
+        (position, heading, field of view, range) — good enough to show where people are, not to the
+        centimetre. Which one is in use is reported to the dashboard."""
+        lay = self.engine.layout
+        cam = lay.cam(self.name) if lay else None
+        if not cam:
+            return None
+        quad = quad or cam.get("floor_quad")
+        if quad and cam.get("floor_rect"):
+            sig = (json.dumps(quad), json.dumps(cam["floor_rect"]), w, h)
+            if self.storeH is None or getattr(self, "_sp_sig", None) != sig:
+                src = np.float32([[x * w, y * h] for x, y in quad][:4])
+                self.storeH = cv2.getPerspectiveTransform(src, np.float32(rect_corners(cam["floor_rect"])))
+                self._sp_sig = sig
+            mx, my = cv2.perspectiveTransform(np.float32([[[fx, fy]]]), self.storeH)[0, 0]
+            self.engine.heat_src[self.name] = "exact"
+            return float(mx), float(my)
+        self.engine.heat_src[self.name] = "approx"
+        return approx_store_point(cam, fx / w, fy / h)
+
+    def cctv(self, frame, boxes, labels=None):
         """Plain security view: the picture plus people boxes, no analytics overlays. Heads are
         still blurred — privacy is a property of the system, not of which tab you open. Only
         encoded while someone is watching the CCTV tab, to spare the edge CPU."""
         self.people = len(boxes)
+        self.engine.on_crowd(self.name, self.people)
         self.cctv_boxes = list(boxes)
         if time.time() - self.cctv_want > 6:
             return
@@ -1302,7 +1643,8 @@ class CamWorker(threading.Thread):
             x1, y1, x2, y2 = map(int, b[:4])
             cv2.rectangle(v, (x1, y1), (x2, y2), (60, 60, 230), 2)
             if len(b) > 4:
-                cv2.putText(v, f"#{b[4]}", (x1, max(12, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 230), 1)
+                cv2.putText(v, (labels or {}).get(b[4], f"#{b[4]}"), (x1, max(12, y1 - 5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 230), 1)
         cv2.putText(v, datetime.now().strftime("%d-%m-%Y %H:%M:%S"), (10, v.shape[0] - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(v, f"{self.name}  people: {len(boxes)}", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
@@ -1412,6 +1754,7 @@ class PeopleWorker(CamWorker):
         self.model = YOLO(CONFIG["person_model"])
         self.g = geom(name)
         self.prev_side, self.last_cross = {}, {}
+        self.shopper_of = {}                  # track id -> the shopper ID given when they came in
         R, C = self.g["floor_grid"]
         self.heat = np.zeros((R, C), np.float32)
         engine.heat[name] = self.heat
@@ -1420,7 +1763,6 @@ class PeopleWorker(CamWorker):
         self.cand, self.members, self.missing = {}, {}, {}
         self.arrivals, self.departures = deque(), deque()
         self.mu_c = CONFIG["queue"]["default_service_per_min"]
-        self.storeH = None            # image -> store metres, built on the first frame
         self._quad = self.g.get("floor_quad")
         self._rect = None
 
@@ -1440,24 +1782,8 @@ class PeopleWorker(CamWorker):
             self.H = self.storeH = None          # remap on the next point
         return g
 
-    def store_point(self, fx, fy, w, h):
-        """Map a foot position to store metres, if this camera is placed in the layout.
-
-        The four floor points clicked with --pick correspond to the floor_rect the user
-        dragged onto the plan, which is what ties every camera into one shared frame.
-        """
-        lay = self.engine.layout
-        quad = self.g.get("floor_quad")
-        if lay is None or not quad:
-            return None
-        cam = lay.cam(self.name)
-        if not cam or not cam.get("floor_rect"):
-            return None
-        if self.storeH is None:
-            src = np.float32([[x * w, y * h] for x, y in quad][:4])
-            self.storeH = cv2.getPerspectiveTransform(src, np.float32(rect_corners(cam["floor_rect"])))
-        mx, my = cv2.perspectiveTransform(np.float32([[[fx, fy]]]), self.storeH)[0, 0]
-        return float(mx), float(my)
+    def store_point(self, fx, fy, w, h, quad=None):
+        return CamWorker.store_point(self, fx, fy, w, h, quad=quad or self.g.get("floor_quad"))
 
     def floor_cell(self, fx, fy, w, h):
         R, C = self.g["floor_grid"]
@@ -1485,7 +1811,7 @@ class PeopleWorker(CamWorker):
         if r.boxes is not None and r.boxes.id is not None:
             for bb, tid in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.id.int().cpu().tolist()):
                 dets.append((*map(float, bb), tid))
-        self.cctv(frame, dets)
+        self.cctv(frame, dets, {t: "SH" + sid.rsplit("-", 1)[1] for t, sid in self.shopper_of.items()})
         vis = frame.copy()
         self.blur(vis, dets)
 
@@ -1505,7 +1831,10 @@ class PeopleWorker(CamWorker):
                 if s != 0:
                     ps = self.prev_side.get(tid)
                     if ps is not None and s != ps and now - self.last_cross.get(tid, 0) > 1.0:
-                        self.engine.on_entry(self.name, "in" if s == g["in_side"] else "out")
+                        sid = self.engine.on_entry(self.name, "in" if s == g["in_side"] else "out",
+                                                   sig=body_signature(frame, (x1, y1, x2, y2)), tid=tid)
+                        if sid:
+                            self.shopper_of[tid] = sid
                         self.last_cross[tid] = now
                     self.prev_side[tid] = s
                 cell = self.floor_cell(foot[0], foot[1], w, h)
@@ -1519,7 +1848,9 @@ class PeopleWorker(CamWorker):
                 in_queue.add(tid)
             col = (0, 200, 255) if tid in in_queue else (80, 220, 120)
             cv2.rectangle(vis, (int(x1), int(y1)), (int(x2), int(y2)), col, 2)
-            cv2.putText(vis, f"#{tid}", (int(x1), int(y1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+            sid = self.shopper_of.get(tid)
+            cv2.putText(vis, "SH" + sid.rsplit("-", 1)[1] if sid else f"#{tid}", (int(x1), int(y1) - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
 
         # close finished zone visits
         for tid in list(self.zone_last):
@@ -1534,6 +1865,8 @@ class PeopleWorker(CamWorker):
                 self.zone_time.pop(tid, None)
         for tid in [t for t, ts in self.last_cross.items() if now - ts > 60]:
             del self.last_cross[tid]
+        if len(self.shopper_of) > 300:        # tracks come and go; keep only the recent ones
+            self.shopper_of = dict(list(self.shopper_of.items())[-150:])
 
         if "entry" in self.roles:
             cv2.line(vis, tuple(map(int, a)), tuple(map(int, b)), (255, 120, 0), 2)
@@ -1599,9 +1932,19 @@ class PeopleWorker(CamWorker):
             if L10 / capn <= qc["target_wait_min"] and lam <= 0.9 * capn and L / capn <= qc["max_wait_min"]:
                 rec = n
                 break
+        def clears(n):
+            """Minutes for today's line to disappear with n counters, at the current arrival rate: the line
+            shrinks by (service − arrivals) a minute. None = arrivals outpace service, it will keep growing."""
+            if L == 0:
+                return 0.0
+            net = self.mu_c * n - lam
+            return round(min(120.0, L / net), 1) if net > 0.05 else None
         self.engine.on_queue(self.name, {
             "length": L, "arrival_per_min": round(lam, 2), "service_per_counter_min": round(self.mu_c, 2),
             "wait_min": round(L / cap, 1), "forecast": forecast, "recommend_counters": rec,
+            "clear_min": clears(k), "clear_min_if_opened": clears(rec) if rec > k else None,
+            "what_if": [{"counters": n, "wait_min": round(L / max(self.mu_c * n, 1e-3), 1), "clear_min": clears(n),
+                         "keeps_up": lam <= 0.9 * self.mu_c * n} for n in range(1, qc["max_counters"] + 1)],
         })
 
 
@@ -1715,19 +2058,22 @@ def backproject(d, hfov_deg):
     return np.stack([d * u[None, :], d * v[:, None], d], -1)
 
 
-def shelf_frame(P0, slots, w, h):
+def shelf_frame(P0, slots, w, h, plane_slots=None):
     """From the calibrated (full) shelf: the plane the product fronts stand on, and for every column
     the patch of that plane its front unit covers. A unit taken from the front leaves the next one
-    further back along the plane's normal — inside the same 'tube', wherever that lands in the picture."""
+    further back along the plane's normal — inside the same 'tube', wherever that lands in the picture.
+    The plane is fitted through the fronts of every box on the shelf (`plane_slots`, default `slots`), so a
+    box with a single column can be counted too; tubes are built only for `slots`."""
     per = {}
-    for s in slots:
+    for s in (plane_slots or slots):
         for box in ShelfWorker.facing_boxes(s, w, h):
             a, b, c2, d2 = depth_region(box, w, h)
             q = P0[b:d2, a:c2].reshape(-1, 3)
             q = q[np.isfinite(q).all(1)]
             if len(q) >= 12:
                 per[(s["id"], box[0])] = (q, s)
-    if len(per) < 2:
+    counted = {s["id"] for s in slots}
+    if not any(k[0] in counted for k in per):
         return None
     X = np.concatenate([q for q, _ in per.values()])
     c = np.median(X, 0)
@@ -1741,8 +2087,10 @@ def shelf_frame(P0, slots, w, h):
     e1 = np.array([1.0, 0, 0]) - n[0] * n
     e1 /= np.linalg.norm(e1)
     e2 = np.cross(n, e1)
-    cols = {}
+    cols, raw = {}, {}
     for k, (q, s) in per.items():
+        if k[0] not in counted:
+            continue
         r = q - c
         dn = r @ n
         front0 = float(np.median(dn))
@@ -1753,9 +2101,43 @@ def shelf_frame(P0, slots, w, h):
         a0, a1 = np.percentile(pa, [5, 95])
         b0, b1 = np.percentile(pb, [5, 95])
         ma, mb = (a1 - a0) * 0.1, (b1 - b0) * 0.1
+        raw[k] = (a0, a1, b0, b1, front0, s)
         # last: points a unit face must show (live passes use every 2nd pixel each way)
         cols[k] = (a0 + ma, a1 - ma, b0 + mb, b1 - mb, front0, max(6, int(on.sum() / 4 * 0.15)))
-    return {"c": c, "n": n, "e1": e1, "e2": e2, "cols": cols}
+    return {"c": c, "n": n, "e1": e1, "e2": e2, "cols": cols, "ev": slice_evidence(P0, c, n, e1, e2, raw)}
+
+
+def slice_evidence(P0, c, n, e1, e2, raw, min_pts=8):
+    """Where on the FULL shelf the camera could see a unit's top or side, behind the front row. Straight on
+    there is nothing to see but the front pack; from above or from the side, the tops/sides of the packs
+    behind it show up as surface at known depths. Later, if those pixels have moved away, those packs are gone —
+    even when the front one is still there. Returns {column: {unit position: (pixel indices, depth then)}}.
+    Positions with too few visible pixels are simply absent: that is 'cannot tell', never a guess."""
+    Ps = P0[::2, ::2].reshape(-1, 3) - c                  # live passes sample every 2nd pixel each way
+    ok = np.isfinite(Ps).all(1)
+    A, B, D = Ps @ e1, Ps @ e2, Ps @ n
+    keys = sorted(raw, key=lambda k: raw[k][0])
+    out = {}
+    for k in keys:
+        a0, a1, b0, b1, f0, s = raw[k]
+        u, hh, ww = s["unit_cm"] / 100.0, b1 - b0, a1 - a0
+        if s["deep"] < 2 or u < 0.04:                    # packs thinner than ~4 cm are within the model's noise
+            continue
+        left = [raw[o] for o in keys if raw[o][1] < a0 and raw[o][2] < b1 and raw[o][3] > b0]
+        right = [raw[o] for o in keys if raw[o][0] > a1 and raw[o][2] < b1 and raw[o][3] > b0]
+        la = max(a0 - 0.5 * ww, (max(r[1] for r in left) + a0) / 2) if left else a0 - 0.5 * ww
+        ra = min(a1 + 0.5 * ww, (min(r[0] for r in right) + a1) / 2) if right else a1 + 0.5 * ww
+        top = (A > a0) & (A < a1) & (B > b0 - 0.2 * hh) & (B < b0 + 0.1 * hh)
+        sides = (B > b0) & (B < b1) & (((A > la) & (A < a0)) | ((A > a1) & (A < ra)))
+        m = (top | sides) & ok
+        ev = {}
+        for pos in range(1, s["deep"]):
+            sel = np.flatnonzero(m & (D > f0 + (pos + 0.25) * u) & (D < f0 + (pos + 0.75) * u))
+            if sel.size >= min_pts:
+                ev[pos] = (sel.astype(np.int32), D[sel].astype(np.float32))
+        if ev:
+            out[k] = ev
+    return out
 
 
 def depth_colour(d, lo=None, hi=None):
@@ -1779,6 +2161,38 @@ def hs_hist(region):
     hist = cv2.calcHist([region], [0, 1], None, [18, 8], [0, 180, 0, 256])
     cv2.normalize(hist, hist)
     return hist
+
+
+def body_signature(frame, box):
+    """Clothing-colour fingerprint of a person: for each of three bands (shoulders to waist, waist to knee,
+    shin down) a histogram of hues, plus how much of the band is dark, grey or light. Brightness is ignored
+    for coloured cloth, so the door camera and the till camera can agree despite different lighting. The head
+    is left out and no picture is kept: it tells the till "this is who the door camera saw", not who anyone is."""
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = (float(v) for v in box[:4])
+    bw, bh = x2 - x1, y2 - y1
+    if bw < 12 or bh < 36:
+        return None
+    xa, xb = int(max(0, x1 + 0.2 * bw)), int(min(w, x2 - 0.2 * bw))
+    bands = []
+    for a, b in ((0.18, 0.45), (0.45, 0.72), (0.72, 1.0)):
+        ya, yb = int(max(0, y1 + a * bh)), int(min(h, y1 + b * bh))
+        if yb - ya < 4 or xb - xa < 4:
+            return None
+        hsv = cv2.cvtColor(frame[ya:yb, xa:xb], cv2.COLOR_BGR2HSV).reshape(-1, 3)
+        hue, sat, val = hsv[:, 0].astype(int), hsv[:, 1], hsv[:, 2]
+        colour = (sat >= 60) & (val >= 60)
+        hist = np.zeros(15, np.float32)
+        hues = np.bincount(np.minimum(hue[colour] * 12 // 180, 11), minlength=12).astype(np.float32)
+        hist[:12] = 0.5 * hues + 0.25 * np.roll(hues, 1) + 0.25 * np.roll(hues, -1)     # red wraps round
+        hist[12:] = np.bincount(np.digitize(val[~colour], (85, 170)), minlength=3)      # dark / grey / light
+        bands.append(hist / max(float(hist.sum()), 1e-6))
+    return np.stack(bands).astype(np.float32)
+
+
+def sig_similarity(a, b):
+    """0..1 — how alike two body signatures are (Bhattacharyya coefficient per band, averaged)."""
+    return float(np.clip(np.sqrt(a * b).sum(1).mean(), 0, 1))
 
 
 def count_badge(img, x_right, y_top, text, colour):
@@ -1813,6 +2227,7 @@ class ShelfWorker(CamWorker):
                 n_sl = len((engine.layout.cam(name) or {}).get("slots") or [])
                 print(f"[{name}] watching {sh['name']} {fc} face, " +
                       (f"{n_sl} product boxes" if n_sl else f"{self.R}x{self.C} grid (no product boxes yet)"))
+        self.t_heat = time.time()
         self.clahe = cv2.createCLAHE(2.0, (8, 8))
         self.ref_path = f"shelf_ref_{name}.png"
         self.ref = cv2.imread(self.ref_path) if os.path.exists(self.ref_path) else None
@@ -1828,6 +2243,8 @@ class ShelfWorker(CamWorker):
         self.depth_geo, self.depth_geo_sig, self.depth_stack = None, None, []
         self.depth_want = 0.0                     # last time someone looked at the depth view
         self.depth_back = defaultdict(lambda: deque(maxlen=CONFIG["shelf"]["depth"]["smooth"]))
+        self.depth_slices = defaultdict(lambda: deque(maxlen=CONFIG["shelf"]["depth"]["smooth"]))   # per pass: unit position -> absent/present/None
+        self.ledger = {}                                  # column -> {"j": front position last seen, "lo": units for sure}
         self.depth_state = {"on": False, "msg": "no product box has a unit depth set", "noise_cm": None}
 
     # ── product slots ────────────────────────────────────────────────
@@ -1931,7 +2348,7 @@ class ShelfWorker(CamWorker):
             return
         hfov = self.hfov()
         if self.depth_geo is None or self.depth_geo_sig != (self.slot_sig, hfov):
-            self.depth_geo = shelf_frame(backproject(self.depth_ref, hfov), want, w, h)
+            self.depth_geo = shelf_frame(backproject(self.depth_ref, hfov), want, w, h, plane_slots=slots)
             self.depth_geo_sig = (self.slot_sig, hfov)
         geo = self.depth_geo
         if geo is None:
@@ -1942,6 +2359,7 @@ class ShelfWorker(CamWorker):
         keep = np.isfinite(P).all(-1)
         for px1, py1, px2, py2 in persons:
             keep[max(0, int(py1) // 2):int(py2) // 2 + 1, max(0, int(px1) // 2):int(px2) // 2 + 1] = False
+        keepf, Pf = keep.reshape(-1), P.reshape(-1, 3)
         R = P[keep] - geo["c"]
         A, B, D = R @ geo["e1"], R @ geo["e2"], R @ geo["n"]
         for s in want:
@@ -1961,6 +2379,7 @@ class ShelfWorker(CamWorker):
                 front = nearest_surface(D[m] - f0, u, npts)     # metres behind the full front
                 # None: nothing solid visible in the tube — neighbours hide it from this angle
                 self.depth_back[(s["id"], i)].append(np.nan if front is None else front / u)
+                self.depth_slices[(s["id"], i)].append(self.judge_slices(geo, (s["id"], i), s, keepf, Pf))
         self.depth_state = {"on": True, "msg": f"{DEPTH['name'] or 'depth model'} · re-anchored every pass",
                             "noise_cm": round(noise * 100, 1)}
         self.depth_picture(da, mask, slots, want, w, h)
@@ -2015,6 +2434,69 @@ class ShelfWorker(CamWorker):
         hist = [v for v in raw if np.isfinite(v)]
         return int(np.clip(round(float(np.median(hist))), 0, s["deep"]))
 
+    @staticmethod
+    def judge_slices(geo, key, s, keepf, Pf):
+        """For each unit position behind the front, from the pixels that showed its top or side on the full
+        shelf: 'absent' if they now lie clearly further back (the pack is gone), 'present' if unchanged,
+        None if there is nothing to judge by (straight-on, thin pack, someone in the way)."""
+        u = s["unit_cm"] / 100.0
+        out = {}
+        for pos, (idx, d0) in (geo.get("ev", {}).get(key) or {}).items():
+            v = keepf[idx]
+            if int(v.sum()) < 8:
+                continue
+            dn = (Pf[idx[v]] - geo["c"]) @ geo["n"] - d0[v]
+            if np.mean(dn > max(0.5 * u, 0.02)) >= 0.6:
+                out[pos] = "absent"
+            elif np.mean(np.abs(dn) < max(0.3 * u, 0.012)) >= 0.6:
+                out[pos] = "present"
+        return out
+
+    def depth_column(self, s, i):
+        """(units in column i, whether some of them are assumed) from the front pack's position plus what
+        the camera can see of the packs behind it. Packs behind the front are taken to follow it unless the
+        surfaces where they should be have moved away. 'Assumed' = at least one position nobody could check."""
+        j = self.depth_units_back(s, i)
+        if j is None:
+            return None
+        if j >= s["deep"]:
+            return 0, False
+        hist = list(self.depth_slices.get((s["id"], i), ()))
+        n, assumed = 1, False
+        for pos in range(j + 1, s["deep"]):
+            votes = [h.get(pos) for h in hist]
+            a, pr = votes.count("absent"), votes.count("present")
+            if a > pr:
+                break
+            if pr == 0:
+                assumed = True
+            n += 1
+        return n, assumed
+
+    def ledger_update(self, s, i, j, upper, assumed):
+        """What is certain about a column. After a pack is put back at the front, the front surface moves
+        forward — but with nothing seen behind it, the column could hold anything from that one pack up to a
+        full stack. So: taking packs away lowers the lower bound by as many; the front coming forward raises
+        it by one (something was added, no more is proven); a column nobody doubts has lower = upper."""
+        key = (s["id"], i)
+        led = self.ledger.get(key)
+        if not assumed or led is None or upper == 0:
+            lo = upper
+        elif j > led["j"]:
+            lo = led["lo"] - (j - led["j"])
+        elif j < led["j"]:
+            lo = led["lo"] + 1
+        else:
+            lo = led["lo"]
+        lo = int(max(0, min(lo, upper)))
+        self.ledger[key] = {"j": j, "lo": lo}
+        return lo
+
+    def refilled(self, slot_id):
+        """Staff say a product box was topped up: forget the doubt about it."""
+        for k in [k for k in self.ledger if k[0] == slot_id]:
+            del self.ledger[k]
+
     def read_slots(self, frame, slots, persons):
         sc = CONFIG["shelf"]
         h, w = frame.shape[:2]
@@ -2023,6 +2505,8 @@ class ShelfWorker(CamWorker):
         if sig != self.slot_sig:
             self.build_slot_ref(slots)
             self.depth_back.clear()
+            self.depth_slices.clear()
+            self.ledger.clear()
             self.recent_corr.clear()
         if now - self.depth_t >= sc["depth"]["every_s"]:
             self.depth_t = now
@@ -2042,7 +2526,7 @@ class ShelfWorker(CamWorker):
                 out.append({**prev, "occluded": True})
                 continue
             ref = self.slot_ref.get(s["id"]) or []
-            present, fills, cols, corrs = 0, [], [], []
+            present, fills, cols, corrs, lows, doubts = 0, [], [], [], [], []
             nf = max(1, s["facings"])
             backs = [self.depth_units_back(s, i) for i in range(nf)] \
                 if s.get("unit_cm", 0) > 0 and self.depth_state["on"] else [None] * nf
@@ -2056,14 +2540,18 @@ class ShelfWorker(CamWorker):
                 if f >= sc["slot_low"] and refh is not None:     # only facings that hold something
                     corrs.append(float(cv2.compareHist(refh, hs_hist(hsv[b:d2, a:c2]), cv2.HISTCMP_CORREL)))
                 if backs[i] is not None:     # depth: how many are gone from the front of this column
-                    left = max(0, s["deep"] - backs[i])
+                    left, assumed = self.depth_column(s, i)
+                    lo = self.ledger_update(s, i, backs[i], left, assumed)
                 else:                        # not measured by depth: front-row rule
                     left = s["deep"] if f >= sc["slot_low"] else 0
                     if self.depth_hidden(s, i):
                         # nothing solid in the column's tube: its front unit is certainly gone,
                         # but neighbours hide how far back the rest goes from this angle
                         left = min(left, s["deep"] - 1)
+                    assumed, lo = s["deep"] > 1 and left > 0, left
                 cols.append(left)
+                lows.append(lo)
+                doubts.append(bool(assumed))
                 if left > 0:
                     present += 1
             n = max(1, s["facings"])
@@ -2075,7 +2563,9 @@ class ShelfWorker(CamWorker):
             self.recent[s["id"]].append(fill)
             fill_s = float(np.median(self.recent[s["id"]]))
             self.history[s["id"]].append((now, fill_s))
-            status = "EMPTY" if est == 0 else ("LOW" if est / full <= 0.5 else "OK")
+            est_min = int(sum(lows))
+            # stock status goes by what is certain: a pack put back at the front doesn't make a shelf look full
+            status = "EMPTY" if est == 0 else ("LOW" if est_min / full <= 0.5 else "OK")
             # planogram: the facings that hold something should look like the product calibrated there
             if corrs:
                 self.recent_corr[s["id"]].append(float(np.median(corrs)))
@@ -2091,6 +2581,9 @@ class ShelfWorker(CamWorker):
                     # "depth": each column counted by how far back its front unit sits (depth model)
                     # "front": facings still visible × stated depth — cannot see behind row 1
                     "est_units": est, "method": method,
+                    # est_units counts packs behind the front as following it; est_min is what is certain,
+                    # and exact says the two agree because every position could be checked
+                    "est_min": est_min, "exact": not any(doubts), "assumed": [i for i, d in enumerate(doubts) if d],
                     "columns": cols if method != "front" else None,
                     "hidden": [i for i in range(nf) if self.depth_hidden(s, i)],
                     "full_units": full, "fill": round(fill_s, 2),
@@ -2142,6 +2635,11 @@ class ShelfWorker(CamWorker):
         pr = self.model(frame, classes=[0], conf=CONFIG["conf"], imgsz=CONFIG["imgsz"], verbose=False)[0]
         persons = pr.boxes.xyxy.cpu().numpy().tolist() if pr.boxes is not None else []
         self.engine.on_aisle(self.name, len(persons), max(self.period, 0.1))
+        dt, self.t_heat = min(now - self.t_heat, 0.5), now
+        for x1, y1, x2, y2 in persons:               # someone browsing is on the floor map as well
+            mp = self.store_point((x1 + x2) / 2, y2, w, h)
+            if mp:
+                self.engine.add_store_heat(mp[0], mp[1], dt)
         self.track_attention(frame, persons, now)
 
         if self.calib_request:
@@ -2159,6 +2657,8 @@ class ShelfWorker(CamWorker):
                 self.depth_ref, self.depth_t, self.depth_geo = None, 0.0, None   # re-derived from the new picture
                 self.t_read, self.ov = 0.0, None     # read the shelf right away
                 self.depth_back.clear()
+                self.depth_slices.clear()
+                self.ledger.clear()
                 sl = self.slots()
                 if sl:
                     self.build_slot_ref(sl)
@@ -2198,10 +2698,11 @@ class ShelfWorker(CamWorker):
                 cv2.rectangle(vis, (x0, y0), (x1, y1), col, 2)
                 for _, a, b2, c3, d3 in self.facing_boxes(s, w, h):
                     cv2.line(vis, (a, b2), (a, d3), col, 1)
-                tag = "~" if c["method"] == "front" else ""
+                tag = "~" if c["method"] == "front" or not c.get("exact", True) else ""
                 cv2.putText(vis, c["name"][:28], (x0 + 2, max(14, y0 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                             (240, 240, 240), 1, cv2.LINE_AA)
-                count_badge(vis, x1, y0, f"{tag}{c['est_units']}/{c['full_units']}", col)
+                lo = c.get("est_min", c["est_units"])
+                count_badge(vis, x1, y0, f"{tag}{lo if lo == c['est_units'] else str(lo) + '-' + str(c['est_units'])}/{c['full_units']}", col)
             return vis
 
         feats = self.features(frame)
@@ -2289,6 +2790,9 @@ class CheckoutWorker(CamWorker):
             pr = self.model(frame, classes=[0], conf=CONFIG["conf"], imgsz=416, verbose=False)[0]
             self.persons = pr.boxes.xyxy.cpu().numpy().tolist() if pr.boxes is not None else []
             self.persons_t = time.time()
+            if self.persons:     # whoever stands closest (largest box) is the one at the till
+                near = max(self.persons, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+                self.engine.till_seen(self.name, body_signature(frame, near))
         self.cctv(frame, self.persons)
         vis = frame.copy()
         self.blur(vis, self.persons, self.persons_t)
@@ -2519,6 +3023,41 @@ def analytics(store, days=14):
         "zones": [{"zone": z, "visits": len(v), "avg_dwell_s": round(float(np.mean(v)), 1)}
                   for z, v in sorted(zones.items())],
     }
+
+
+def queue_analytics(store, days=14):
+    """What the Queue tab draws besides the live numbers: today minute by minute (real trading only), how
+    busy each weekday/hour usually is, crowd episodes, and the day's headline figures."""
+    t0 = day_start()
+    since = t0 - (max(1, min(int(days), 90)) - 1) * 86400
+    rows = defaultdict(dict)
+    for ts, k, v in store.q("SELECT ts,key,value FROM metrics WHERE ts>=? AND demo=0 AND key IN "
+                            "('queue_len','queue_wait_min','counters_open') ORDER BY ts", t0):
+        rows[round(ts / 60) * 60][k] = v
+    today = [{"t": t, "len": d.get("queue_len"), "wait": d.get("queue_wait_min"), "counters": d.get("counters_open")}
+             for t, d in sorted(rows.items())]
+    by = defaultdict(list)
+    for ts, v in store.q("SELECT ts,value FROM metrics WHERE key='queue_len' AND ts>=?", since):
+        t = _local(ts)
+        by[(t.weekday(), t.hour)].append(v)
+    busy = [[round(float(np.mean(by[(w, h)])), 2) if by[(w, h)] else 0 for h in range(24)] for w in range(7)]
+    served = [json.loads(d)["duration_s"] for (d,) in store.q("SELECT data FROM events WHERE type='served' AND ts>=? AND demo=0", t0)]
+    waits = [r["wait"] for r in today if r["wait"] is not None]
+    lens = [r["len"] for r in today if r["len"] is not None]
+    crowds = [{"ts": ts, **json.loads(d)} for ts, d in
+              store.q("SELECT ts,data FROM events WHERE type='crowd' AND ts>=? ORDER BY ts DESC LIMIT 20", t0)]
+    peak_h = None
+    hr = defaultdict(list)
+    for r in today:
+        if r["len"] is not None:
+            hr[_local(r["t"]).hour].append(r["len"])
+    if hr:
+        peak_h = max(hr, key=lambda h: np.mean(hr[h]))
+    return {"today": today, "weekday_hour": busy, "has_demo": store.has_demo(), "crowds": crowds,
+            "stats": {"served": len(served), "avg_in_queue_min": round(float(np.mean(served)) / 60, 2) if served else None,
+                      "peak_len": max(lens) if lens else 0, "peak_wait_min": max(waits) if waits else 0,
+                      "avg_wait_min": round(float(np.mean(waits)), 2) if waits else None,
+                      "busiest_hour": f"{peak_h:02d}:00" if peak_h is not None else None}}
 
 
 def hourly_timeseries(store, days=30):
@@ -2865,6 +3404,12 @@ canvas.plan{background:#0f1114;border:1px solid var(--line);border-radius:10px;
 .chips{display:flex;gap:6px;flex-wrap:wrap}
 .chip{border:1px solid var(--line);border-radius:7px;padding:4px 9px;font-size:12.5px;cursor:pointer;user-select:none}
 .chip.on{background:var(--accsoft);border-color:var(--accline);color:var(--acc2);font-weight:600}
+.shop{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--card2);border:1px solid var(--line);
+ border-radius:10px;padding:10px 12px;margin-bottom:12px}
+.shop .who{flex:1 1 180px;min-width:0}.shop .lbl{display:block;color:var(--mute);font-size:11.5px}
+.shop .sid{font-size:17px;letter-spacing:.02em}.shop .sid small{font-size:11.5px;color:var(--mute);font-weight:450;margin-left:6px}
+.shop select{background:#0f1114;border:1px solid var(--line);border-radius:7px;color:var(--text);padding:6px 8px;font:inherit;font-size:13px;max-width:100%}
+.shop.ok{border-color:#2c5a36}.shop.warn{border-color:#6b5420}
 .hint{color:var(--mute);font-size:12px;line-height:1.45}
 .empty{text-align:center;color:var(--mute);padding:26px 10px;font-size:13px}
 .warnline{margin-top:10px;font-size:12.5px}
@@ -2954,10 +3499,15 @@ td,th{font-size:14.5px;padding:9px 6px}th{font-size:13px}
 .s3{grid-column:span 3}@media(max-width:1300px){.s3{grid-column:span 6}}@media(max-width:1100px){.s3{grid-column:1/-1}}
 /* home: every row the same height, long lists scroll inside their card */
 #home{align-items:stretch}
-.hcard{display:flex;flex-direction:column;height:460px}.hcard2{display:flex;flex-direction:column;height:400px}
+.hcard{display:flex;flex-direction:column;height:460px}.hcard2{display:flex;flex-direction:column;height:520px}
 .hcard .body,.hcard2 .body{flex:1;min-height:0;overflow:auto}
 .body.mini{display:flex;flex-direction:column;gap:10px}
-.body.mini canvas{width:100%;flex:1;min-height:0;object-fit:contain;border-radius:10px}
+.body.mini canvas{width:100%;flex:1;min-height:0;object-fit:contain;border-radius:10px;cursor:grab}
+.seg{display:inline-flex}.seg button{border-radius:0;padding:3px 11px;font-size:12px}
+.seg button:first-child{border-radius:7px 0 0 7px}.seg button:last-child{border-radius:0 7px 7px 0;border-left:0}
+.hlegend{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--mute)}
+.hlegend i{flex:0 0 120px;height:7px;border-radius:4px;background:linear-gradient(90deg,#266ec8,#1ebeaa,#ebc83c,#fa7828,#ff3246)}
+.hlegend em{margin-left:auto;font-style:normal;text-align:right}
 @media(max-width:1100px){.hcard,.hcard2{height:auto}.hcard .body,.hcard2 .body{max-height:420px}}
 .alert{padding:12px 14px;margin-bottom:8px;gap:14px}
 .alert .top{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
@@ -2985,11 +3535,63 @@ td,th{font-size:14.5px;padding:9px 6px}th{font-size:13px}
 .livegrid>div{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:14px 16px 8px}
 .lt{display:flex;justify-content:space-between;align-items:baseline;font-weight:600;font-size:14.5px;margin-bottom:6px}
 .lt b{font-size:24px;font-weight:700}.lt small{color:var(--mute);font-weight:400;font-size:12.5px;margin-left:6px}
+/* ---- analytics ---- */
+#analytics{gap:16px;align-items:stretch}
+.ahead{grid-column:1/-1;display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;padding:4px 2px 2px}
+.ahead h2{margin:0;font-size:28px;letter-spacing:-.025em;line-height:1.1}.ahead p{margin:5px 0 0;color:var(--mute);font-size:13.5px}
+.ahr{display:flex;flex-direction:column;align-items:flex-end;gap:8px}
+.sech{grid-column:1/-1;display:flex;align-items:center;gap:12px;margin:20px 2px 0}
+.sech h4{margin:0;font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--text);font-weight:650}
+.sech i{flex:1;height:1px;background:linear-gradient(90deg,var(--line),transparent)}.sech .muted{font-size:12px}
+.akp{grid-column:1/-1;display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px}
+.hk{background:linear-gradient(180deg,#1c1f25,var(--card));border:1px solid var(--line);border-radius:14px;padding:16px 16px 10px;min-width:0;position:relative;overflow:hidden}
+.hk .l{color:var(--mute);font-size:12.5px;font-weight:500}
+.hk .v{font-size:30px;font-weight:700;letter-spacing:-.03em;line-height:1.15;margin:2px 0 6px;white-space:nowrap}
+.hk .dl{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--mute);min-height:22px;white-space:nowrap}
+.hk svg{display:block;width:calc(100% + 4px);height:38px;margin:8px -2px 0}
+.pill{padding:1px 8px;border-radius:99px;font-weight:650;font-size:11.5px;border:1px solid}
+.pill.up{color:#6fdc8c;border-color:#2c5a36;background:#12261a}.pill.dn{color:#ff8d8f;border-color:#6b2a2c;background:#2a1315}
+.pill.flat{color:var(--mute);border-color:var(--line);background:var(--card2)}
+.ins{grid-column:1/-1;display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
+.in{border:1px solid var(--line);border-radius:14px;padding:14px 16px;background:var(--card);display:flex;gap:12px;align-items:flex-start}
+.in .ic{flex:0 0 34px;height:34px;border-radius:10px;background:var(--accsoft);color:var(--acc2);display:grid;place-items:center;font-size:16px;border:1px solid var(--accline)}
+.in b{display:block;font-size:11.5px;color:var(--mute);font-weight:550;letter-spacing:.04em;text-transform:uppercase;margin-bottom:3px}
+.in span{font-size:14px;line-height:1.4}.in span em{font-style:normal;font-weight:650}
+.livestrip{background:none!important;border:0!important;padding:0!important}
+#analytics .livegrid{grid-template-columns:repeat(4,minmax(0,1fr))}
+#analytics .livegrid>div{border-radius:14px;background:var(--card);padding:14px 14px 6px}
+#analytics .lt{font-size:13px;color:var(--mute);font-weight:550}#analytics .lt b{color:var(--text);font-size:26px;letter-spacing:-.02em}
+#analytics .card{border-radius:14px;padding:18px 18px 14px}
+#analytics .card h3{font-size:14.5px;margin-bottom:14px}
+.ashop{display:grid;grid-template-columns:1fr 1fr;gap:10px}.ashop>div{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.ashop b{display:block;font-size:26px;letter-spacing:-.02em;line-height:1.1}.ashop span{color:var(--mute);font-size:12.5px}
+@media(max-width:1250px){.akp{grid-template-columns:repeat(3,minmax(0,1fr))}#analytics .livegrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:700px){.akp{grid-template-columns:repeat(2,minmax(0,1fr))}.ahr{align-items:flex-start}}
+.warnbox{background:#2b2210;border:1px solid #6b5420;color:#f0d9a0;border-radius:9px;padding:9px 11px;font-size:12.5px;line-height:1.45;margin:8px 0}
+.tabdot{display:none;width:8px;height:8px;border-radius:50%;background:var(--bad);margin-left:5px;vertical-align:1px}
+.tabdot.on{display:inline-block;animation:qpulse 1.6s infinite}.tabdot.warn{background:var(--low)}
+@keyframes qpulse{50%{opacity:.35}}
+.verdict{display:flex;gap:16px;align-items:center;padding:14px 16px;border-radius:12px;border:1px solid var(--line);background:var(--card2);margin-bottom:14px}
+.verdict .big{font-size:34px;font-weight:700;letter-spacing:-.02em;line-height:1;min-width:112px}
+.verdict .why{color:var(--mute);font-size:13px}.verdict .why b{color:var(--text);font-weight:600}
+.verdict.ok{border-color:#2c5a36}.verdict.ok .big{color:var(--ok)}
+.verdict.warn{border-color:#6b5420}.verdict.warn .big{color:var(--low)}
+.verdict.bad{border-color:#6b2a2c}.verdict.bad .big{color:var(--bad)}
+table.wi td,table.wi th{padding:9px 8px}table.wi tr.cur td{background:#1d2026}
+table.wi tr.rec td{background:var(--accsoft)}table.wi .tag{font-size:11px;border-radius:99px;padding:2px 8px;margin-left:6px;border:1px solid var(--line);color:var(--mute)}
+table.wi tr.rec .tag{border-color:var(--accline);color:var(--acc2)}
+.crowd{display:grid;grid-template-columns:auto 1fr auto;gap:6px 14px;align-items:center;padding:12px 14px;border:1px solid var(--line);
+ border-left:3px solid var(--low);border-radius:10px;background:var(--card2);margin-bottom:8px}
+.crowd.crit{border-left-color:var(--bad)}.crowd .n{font-size:30px;font-weight:700;line-height:1;grid-row:span 2}
+.crowd .w{font-weight:600}.crowd .t{color:var(--mute);font-size:12.5px}.crowd .eta{grid-column:2/4;font-size:13px}
+.qimg{width:100%;border-radius:10px;border:1px solid var(--line);display:block}
+.qstat{display:grid;grid-template-columns:1fr auto;gap:2px 12px}.qstat div{padding:9px 0;border-bottom:1px solid var(--line2)}
+.qstat div:nth-child(even){text-align:right;font-weight:650}.qstat div:nth-child(odd){color:var(--mute)}
 </style></head><body>
 <header><b>StoreSense Edge</b>
  <nav class="tabs" id="tabs">
   <div class="tab on" data-t="home">Home</div><div class="tab" data-t="shelves">Shelves</div>
-  <div class="tab" data-t="checkout">Checkout</div><div class="tab" data-t="cctv">CCTV</div>
+  <div class="tab" data-t="checkout">Checkout</div><div class="tab" data-t="queue">Queue <span class="tabdot" id="qdot"></span></div><div class="tab" data-t="cctv">CCTV</div>
   <div class="tab" data-t="analytics">Analytics</div><div class="tab" data-t="setup">Setup</div></nav>
  <div class="right"><span class="pill" id="store"></span><span class="pill" id="conn">connecting…</span>
   <span class="pill" id="cloud"></span></div></header>
@@ -3002,9 +3604,10 @@ td,th{font-size:14.5px;padding:9px 6px}th{font-size:13px}
 <section class="card s3 hcard"><h3>Queue <span class="sub">counters
  <input id="ctr" type="number" min="1" max="10" style="width:58px"> <button onclick="setCounters()">Set</button></span></h3>
  <div class="body" id="queues"></div></section>
-<section class="card s7 hcard2"><h3>Footfall today <span class="sub">entries per hour</span></h3><div class="body"><div class="chart" id="c_today"></div></div></section>
-<section class="card s5 hcard2"><h3>Floor heatmap <span class="sub">where shoppers spend time</span></h3>
- <div class="body mini"><canvas id="mini"></canvas><div id="zones"></div></div></section>
+<section class="card s6 hcard2"><h3>Footfall today <span class="sub">entries per hour</span></h3><div class="body"><div class="chart" id="c_today"></div></div></section>
+<section class="card s6 hcard2"><h3>Floor heatmap <span class="sub"><span class="seg"><button id="hm_now" class="on" onclick="heatMode('now')">Now</button><button id="hm_day" onclick="heatMode('day')">Today</button></span></span></h3>
+ <div class="body mini"><canvas id="h3d" title="drag to turn · scroll to zoom · double-click to reset"></canvas>
+  <div class="hlegend"><span>quiet</span><i></i><span>busy</span><em id="hnote"></em></div><div id="zones"></div></div></section>
 <section class="card s12"><h3>Reports <span class="sub"><button onclick="report('day')">Today</button>
  <button onclick="report('week')">7 days</button></span></h3><div id="report" class="muted">Pick a period to see a summary.</div></section>
 </main>
@@ -3031,6 +3634,7 @@ td,th{font-size:14.5px;padding:9px 6px}th{font-size:13px}
 
 <main id="checkout" style="display:none">
 <section class="card s7"><h3>Cart <span class="sub" id="cartid"></span></h3>
+ <div id="shopbar"></div>
  <div class="scanrow"><input id="scan" placeholder="Scan a barcode — or type a SKU or product name" autocomplete="off">
   <button class="pri" onclick="scanSubmit()">Add</button></div>
  <div id="suggest"></div><div id="scanmsg" class="muted"></div>
@@ -3043,6 +3647,22 @@ td,th{font-size:14.5px;padding:9px 6px}th{font-size:13px}
  <div class="billwrap"><img id="billimg" alt="bill"><div class="paynote" id="paynote"></div></div></section>
 </main>
 
+<main id="queue" style="display:none">
+<section class="kpis" id="qkpis"></section>
+<section class="card s7"><h3>Will the line clear? <span class="sub">at today's arrival and service rates</span></h3>
+ <div id="qverdict"></div>
+ <table class="wi" id="qwhatif"></table>
+ <div class="bar2" style="margin:14px 0 0"><span class="muted">Counters open</span>
+  <input id="qctr" type="number" min="1" max="10" style="width:64px"> <button onclick="qSetCounters()">Set</button>
+  <button class="pri" id="qopen" style="display:none" onclick="qOpenRec()"></button></div></section>
+<section class="card s5"><h3>Queue camera <span class="sub">faces blurred</span></h3><div id="qcam"></div></section>
+<section class="card s6"><h3>Crowds <span class="sub" id="qcrowdsub"></span></h3><div id="qcrowds"></div></section>
+<section class="card s6"><h3>Staff calls <span class="sub" id="qresp"></span></h3><div id="qcalls"></div></section>
+<section class="card s8"><h3>Queue today <span class="sub">people in line and wait, per minute</span></h3><div class="chart" id="q_today"></div></section>
+<section class="card s4"><h3>Today so far</h3><div class="qstat" id="qstats"></div></section>
+<section class="card s12"><h3>When queues build <span class="sub">average people in line, by weekday and hour</span></h3><div class="chart" id="q_heat"></div></section>
+</main>
+
 <main id="cctv" style="display:none">
 <section class="card s12"><h3>Cameras <span class="sub">
   <span class="chip on" id="cv_plain" onclick="cctvMode('cctv')">Plain</span>
@@ -3052,37 +3672,43 @@ td,th{font-size:14.5px;padding:9px 6px}th{font-size:13px}
 </main>
 
 <main id="analytics" style="display:none">
+<header class="ahead"><div><h2>Analytics</h2><p id="asub">How the store has been doing</p></div>
+ <div class="ahr"><span class="seg" id="arange"><button data-d="7">7 days</button><button class="on" data-d="14">14 days</button><button data-d="30">30 days</button></span>
+  <span class="exports"><a class="lnk" href="/api/export/timeseries_hourly.csv?days=90">hourly series</a> · <a class="lnk" href="/api/export/timeseries_minute.csv">per-minute log</a> ·
+  <a class="lnk" href="/api/export/bills.csv?days=90">bills</a> · <a class="lnk" href="/api/export/products.csv">products</a></span></div></header>
 <section class="s12 demobanner" id="demobanner" style="display:none"></section>
-<section class="card s12"><h3><span><span class="livedot"></span>Live <span class="sub" style="margin-left:8px">moves every second · real trading only, no demo data</span></span>
-  <span class="sub" id="lwin"><span class="chip on" data-w="300">5 min</span><span class="chip" data-w="1800">30 min</span>
-  <span class="chip" data-w="3600">60 min</span></span></h3>
- <div class="livegrid">
-  <div><div class="lt"><span>People inside</span><b id="lv_inside">—</b></div><div class="chart" id="l_inside"></div></div>
+
+<section class="akp" id="akpis"></section>
+<section class="ins" id="ains"></section>
+
+<div class="sech"><h4>Right now</h4><i></i><span class="muted">moves every second · real trading only, no demo data</span>
+ <span class="seg" id="lwin"><button class="on" data-w="300">5 min</button><button data-w="1800">30 min</button><button data-w="3600">60 min</button></span></div>
+<section class="s12 livestrip"><div class="livegrid">
+  <div><div class="lt"><span><span class="livedot"></span>People inside</span><b id="lv_inside">—</b></div><div class="chart" id="l_inside"></div></div>
   <div><div class="lt"><span>Entries per minute</span><b id="lv_ent">—</b></div><div class="chart" id="l_ent"></div></div>
   <div><div class="lt"><span>Queue length</span><b id="lv_queue">—</b></div><div class="chart" id="l_queue"></div></div>
   <div><div class="lt"><span>Sales today</span><b id="lv_sales">—</b></div><div class="chart" id="l_sales"></div></div>
  </div></section>
-<section class="card s12"><h3>Store analytics <span class="sub" id="arange">
-  <span class="chip" data-d="7">7 days</span><span class="chip on" data-d="14">14 days</span>
-  <span class="chip" data-d="30">30 days</span></span></h3><div class="kpis inner" id="akpis"></div>
- <div class="exports">Download for modelling:
-  <a class="lnk" href="/api/export/timeseries_hourly.csv?days=90">hourly time series</a> ·
-  <a class="lnk" href="/api/export/timeseries_minute.csv">per-minute log</a> ·
-  <a class="lnk" href="/api/export/bills.csv?days=90">bills</a> ·
-  <a class="lnk" href="/api/export/products.csv">products</a></div></section>
+
+<div class="sech"><h4>Traffic and sales</h4><i></i></div>
 <section class="card s8"><h3>Footfall and bills per day <span class="sub">complete days</span></h3><div class="chart" id="c_daily"></div></section>
 <section class="card s4"><h3>Conversion <span class="sub">bills ÷ entries</span></h3><div class="chart" id="c_conv"></div></section>
-<section class="card s12"><h3>When the store is busy <span class="sub">average entries by weekday and hour</span></h3>
+<section class="card s12"><h3>When the store is busy <span class="sub">average entries by weekday and hour · darker = quieter</span></h3>
  <div class="chart" id="c_heat"></div></section>
-<section class="card s6"><h3>Footfall by hour of day <span class="sub">average per day</span></h3><div class="chart" id="c_hour"></div></section>
-<section class="card s6"><h3>Revenue per day</h3><div class="chart" id="c_rev"></div></section>
+<section class="card s4"><h3>Footfall by hour of day <span class="sub">average per day</span></h3><div class="chart" id="c_hour"></div></section>
+<section class="card s4"><h3>Revenue by hour <span class="sub">average per day</span></h3><div class="chart" id="c_revh"></div></section>
+<section class="card s4"><h3>Revenue per day</h3><div class="chart" id="c_rev"></div></section>
+
+<div class="sech"><h4>Products and shelves</h4><i></i></div>
 <section class="card s6"><h3>Top products <span class="sub">by revenue</span></h3><div class="chart" id="c_top"></div></section>
-<section class="card s6"><h3>Stock-outs <span class="sub">times a product ran empty</span></h3><div class="chart" id="c_stock"></div></section>
 <section class="card s6"><h3>Shopper attention by product <span class="sub">stops of 1.5 s or more in front of it</span></h3><div class="chart" id="c_look"></div></section>
+<section class="card s6"><h3>Stock-outs <span class="sub">times a product ran empty</span></h3><div class="chart" id="c_stock"></div></section>
 <section class="card s6"><h3>Store zones <span class="sub">visits · hover for average dwell</span></h3><div class="chart" id="c_zones"></div></section>
+
+<div class="sech"><h4>Checkout and service</h4><i></i></div>
 <section class="card s4"><h3>Basket size <span class="sub">items per bill</span></h3><div class="chart" id="c_basket"></div></section>
 <section class="card s4"><h3>Queue wait</h3><div class="chart" id="c_wait"></div></section>
-<section class="card s4"><h3>Revenue by hour <span class="sub">average per day</span></h3><div class="chart" id="c_revh"></div></section>
+<section class="card s4"><h3>Shopper IDs today <span class="sub">issued at the door, checked at the till</span></h3><div id="a_shop"></div></section>
 </main>
 
 <main id="setup" style="display:none">
@@ -3115,7 +3741,7 @@ td,th{font-size:14.5px;padding:9px 6px}th{font-size:13px}
 
 <script>
 const $=i=>document.getElementById(i);
-let LAY={store:{w:6,h:4},shelves:[],cameras:[]},SEL=null,DRAG=null,HEAT=null,HOV=null,DIRTY=false,S=null;
+let LAY={store:{w:6,h:4},shelves:[],cameras:[]},SEL=null,DRAG=null,HEAT=null,HEATDAY=null,HEATNOW=null,HEATMODE='now',HOV=null,DIRTY=false,S=null;
 const FACES=['N','E','S','W'],SNAP=0.25;
 
 /* ---------- geometry ---------- */
@@ -3146,10 +3772,11 @@ function planDraw(cv,opts){const IW=opts.w||1100;if(cv.width!==IW)cv.width=IW;
  const sc=IW/LAY.store.w,H=Math.max(140,Math.round(sc*LAY.store.h));if(cv.height!==H)cv.height=H;
  const X=cv.getContext('2d'),m=v=>v*sc;X.clearRect(0,0,IW,H);
  X.fillStyle='#0f1114';X.fillRect(0,0,IW,H);
- if(HEAT&&HEAT.length){const R=HEAT.length,C=HEAT[0].length,cw=IW/C,ch=H/R;
-  for(let r=0;r<R;r++)for(let c=0;c<C;c++){const v=HEAT[r][c];if(v>0.02){
-   X.fillStyle=`rgba(${Math.round(200+55*v)},${Math.round(90-60*v)},${Math.round(70-45*v)},${0.30+0.60*v})`;
-   X.fillRect(c*cw,r*ch,cw+.6,ch+.6)}}}
+ if(HEAT&&HEAT.length){const R=HEAT.length,C=HEAT[0].length,oc=document.createElement('canvas');oc.width=C;oc.height=R;   /* one pixel per cell, scaled up smoothly: a soft glow, not squares */
+  const ox=oc.getContext('2d'),im=ox.createImageData(C,R);
+  for(let r=0;r<R;r++)for(let c=0;c<C;c++){const v=HEAT[r][c],k=(r*C+c)*4,m=hcol(v).match(/[\d.]+/g);
+   im.data[k]=+m[0];im.data[k+1]=+m[1];im.data[k+2]=+m[2];im.data[k+3]=v>0.02?Math.round(255*Math.min(.85,.25+.7*v)):0}
+  ox.putImageData(im,0,0);X.imageSmoothingEnabled=true;X.imageSmoothingQuality='high';X.drawImage(oc,0,0,IW,H)}
  X.lineWidth=1;for(let x=0;x<=LAY.store.w+1e-6;x+=0.5){X.strokeStyle=Math.abs(x%1)<1e-6?'#23272e':'#191c21';
   X.beginPath();X.moveTo(m(x),0);X.lineTo(m(x),H);X.stroke()}
  for(let y=0;y<=LAY.store.h+1e-6;y+=0.5){X.strokeStyle=Math.abs(y%1)<1e-6?'#23272e':'#191c21';
@@ -3198,9 +3825,10 @@ function planDraw(cv,opts){const IW=opts.w||1100;if(cv.width!==IW)cv.width=IW;
  return sc}
 let SC=60;
 function draw(){SC=planDraw($('plan'),{edit:true})}
-function drawMini(){const c=$('mini');if(!c)return;const box=c.parentElement,zh=($('zones')||{}).offsetHeight||0;
- const aw=box.clientWidth||700,ah=Math.max(160,(box.clientHeight||360)-zh-10),asp=LAY.store.w/LAY.store.h;
- planDraw(c,{edit:false,w:Math.round(Math.max(320,Math.min(aw,ah*asp))),cones:false})}
+function drawMini(){draw3d('h3d')}
+function heatMode(m){HEATMODE=m;HEAT=m==='now'?HEATNOW:HEATDAY;
+ $('hm_now').className=m==='now'?'on':'';$('hm_day').className=m==='day'?'on':'';
+ if(TABV==='home')drawMini();if(TABV==='setup'){draw();draw3d('v3d')}}
 function selObj(){if(!SEL)return null;
  if(SEL.t==='s')return LAY.shelves.find(s=>s.id===SEL.id);
  if(SEL.t==='c')return LAY.cameras.find(c=>c.id===SEL.id);
@@ -3417,20 +4045,29 @@ function ovDraw(){const ov=$('ov');if(!ov)return;const X=ov.getContext('2d'),W=o
   for(const p of c[k]){const q=P(p);X.beginPath();X.arc(q[0],q[1],5,0,6.3);X.fill();
    X.strokeStyle='#0f1114';X.lineWidth=1.5;X.stroke()}}}
 /* ---------- 3D ---------- */
-let YAW=-0.62,PIT=0.92,ZOOM=1,D3=null;
+/* One renderer, two views of the store: Setup shows everything (cameras and what they see), Home shows a
+   medium-sized model with only the shelf and fixture names. Heat is a surface that rises where people have been. */
+let YAW=-0.62,PIT=0.92,ZOOM=1;
+const V3={v3d:{yaw:-0.62,pit:0.92,zoom:1},h3d:{yaw:-0.62,pit:1.0,zoom:1.18}};
 function raw(p){const ca=Math.cos(YAW),sa=Math.sin(YAW),cp=Math.cos(PIT),sp=Math.sin(PIT);
  const x=p[0]-LAY.store.w/2,y=p[1]-LAY.store.h/2,z=p[2];
  const X=x*ca-y*sa,Y=x*sa+y*ca;
  return [X,-(Y*sp+z*cp)*0.72,Y*cp-z*sp]}
 let VX=0,VY=0,VS=60;
 function proj(p){const r=raw(p);return [VX+r[0]*VS,VY+r[1]*VS,r[2]]}
-function fit3d(W,H){const zs=[0,...LAY.shelves.map(s=>s.height||1.8),...LAY.cameras.map(c=>c.height||2.2),...FIX().map(f=>f.height||1)];
+function fit3d(W,H,zmin){const zs=[0,...LAY.shelves.map(s=>s.height||1.8),...LAY.cameras.map(c=>c.height||2.2),...FIX().map(f=>f.height||1)];
  const zmax=Math.max(...zs);let x0=1e9,x1=-1e9,y0=1e9,y1=-1e9;
  for(const X of [0,LAY.store.w])for(const Y of [0,LAY.store.h])for(const Z of [0,zmax]){
   const r=raw([X,Y,Z]);x0=Math.min(x0,r[0]);x1=Math.max(x1,r[0]);y0=Math.min(y0,r[1]);y1=Math.max(y1,r[1])}
  VS=Math.min(W/(x1-x0+0.6),H/(y1-y0+0.6))*ZOOM;
  VX=W/2-(x0+x1)/2*VS;VY=H/2-(y0+y1)/2*VS}
-function draw3d(){const cv=$('v3d');const W=1320,H=620;if(cv.width!==W){cv.width=W;cv.height=H}
+const HSTOPS=[[0,[38,110,200]],[.25,[30,190,170]],[.5,[235,200,60]],[.75,[250,120,40]],[1,[255,50,70]]];
+function hcol(v,a){v=Math.max(0,Math.min(1,v));let i=0;while(i<HSTOPS.length-2&&v>HSTOPS[i+1][0])i++;
+ const [t0,c0]=HSTOPS[i],[t1,c1]=HSTOPS[i+1],f=(v-t0)/(t1-t0);
+ return `rgba(${c0.map((c,k)=>Math.round(c+(c1[k]-c)*f)).join(',')},${a===undefined?(0.2+0.7*v).toFixed(2):a})`}
+function draw3d(id,o){id=id||'v3d';o=o||(id==='v3d'?{cams:true}:{cams:false});
+ const cv=$(id);if(!cv)return;const st=V3[id];YAW=st.yaw;PIT=st.pit;ZOOM=st.zoom;
+ const W=id==='v3d'?1320:980,H=id==='v3d'?620:600;if(cv.width!==W){cv.width=W;cv.height=H}
  const X=cv.getContext('2d');X.clearRect(0,0,W,H);X.fillStyle='#0f1114';X.fillRect(0,0,W,H);
  fit3d(W,H);
  const polys=[];
@@ -3439,11 +4076,15 @@ function draw3d(){const cv=$('v3d');const W=1320,H=620;if(cv.width!==W){cv.width
  for(let x=0;x<=LAY.store.w+1e-6;x+=1)push([[x,0,0],[x,LAY.store.h,0]],null,'#23272e',1);
  for(let y=0;y<=LAY.store.h+1e-6;y+=1)push([[0,y,0],[LAY.store.w,y,0]],null,'#23272e',1);
  push([[0,0,0],[LAY.store.w,0,0],[LAY.store.w,LAY.store.h,0],[0,LAY.store.h,0]],null,'#454b55',2);
- if(HEAT&&HEAT.length){const R=HEAT.length,C=HEAT[0].length,cw=LAY.store.w/C,ch=LAY.store.h/R;
-  for(let r=0;r<R;r++)for(let c=0;c<C;c++){const v=HEAT[r][c];if(v<=0.02)continue;
-   push([[c*cw,r*ch,0.002],[(c+1)*cw,r*ch,0.002],[(c+1)*cw,(r+1)*ch,0.002],[c*cw,(r+1)*ch,0.002]],
-    `rgba(${Math.round(200+55*v)},${Math.round(90-60*v)},${Math.round(70-45*v)},${0.35+0.6*v})`,null,0)}}
- for(const c of LAY.cameras){const half=c.fov*Math.PI/360,hd=c.heading*Math.PI/180,z=c.height||2.2;
+ if(HEAT&&HEAT.length){                      // heat as a surface: cells rise with how busy they are, corners are averaged so it is smooth
+  const R=HEAT.length,C=HEAT[0].length,cw=LAY.store.w/C,ch=LAY.store.h/R,HM=0.75;
+  const hv=(r,c)=>HEAT[Math.max(0,Math.min(R-1,r))][Math.max(0,Math.min(C-1,c))];
+  const vh=(r,c)=>(hv(r-1,c-1)+hv(r-1,c)+hv(r,c-1)+hv(r,c))/4;
+  for(let r=0;r<R;r++)for(let c=0;c<C;c++){const v=HEAT[r][c];
+   const z=[vh(r,c),vh(r,c+1),vh(r+1,c+1),vh(r+1,c)];if(v<=0.02&&Math.max(...z)<=0.02)continue;
+   const col=hcol((v+z[0]+z[1]+z[2]+z[3])/5);
+   push([[c*cw,r*ch,z[0]*HM+.002],[(c+1)*cw,r*ch,z[1]*HM+.002],[(c+1)*cw,(r+1)*ch,z[2]*HM+.002],[c*cw,(r+1)*ch,z[3]*HM+.002]],col,col,0.8)}}
+ if(o.cams)for(const c of LAY.cameras){const half=c.fov*Math.PI/360,hd=c.heading*Math.PI/180,z=c.height||2.2;
   const arc=[];for(let i=0;i<=16;i++){const a=hd-half+2*half*i/16;
    arc.push(clip([c.x,c.y],[c.x+Math.cos(a)*c.range,c.y+Math.sin(a)*c.range]))}
   push([[c.x,c.y,z],[arc[0][0],arc[0][1],0]],null,'rgba(228,0,43,.6)',1,[4,4]);
@@ -3466,14 +4107,12 @@ function draw3d(){const cv=$('v3d');const W=1320,H=620;if(cv.width!==W){cv.width
  for(const p of polys){X.beginPath();p.pr.forEach((q,i)=>i?X.lineTo(q[0],q[1]):X.moveTo(q[0],q[1]));
   if(p.fill){X.closePath();X.fillStyle=p.fill;X.fill()}
   if(p.stroke){X.setLineDash(p.dash||[]);X.strokeStyle=p.stroke;X.lineWidth=p.lw;X.stroke();X.setLineDash([])}}
- X.font='600 12px system-ui';X.textAlign='center';
- for(const s of LAY.shelves){const q=proj([s.x,s.y,(s.height||1.8)+0.14]);
-  X.strokeStyle='#0f1114';X.lineWidth=3.5;X.strokeText(s.name,q[0],q[1]);
-  X.fillStyle='#c3c9d2';X.fillText(s.name,q[0],q[1])}
- for(const f of FIX()){const q=proj([f.x,f.y,(f.kind==='door'?0:f.height||1)+0.14]);
-  X.strokeStyle='#0f1114';X.lineWidth=3.5;X.strokeText(f.name,q[0],q[1]);
-  X.fillStyle=f.kind==='door'?'#7ee2a0':f.kind==='counter'?'#a9c6ee':'#c9c0ad';X.fillText(f.name,q[0],q[1])}
- for(const c of LAY.cameras){const q=proj([c.x,c.y,c.height||2.2]);
+ X.font=(id==='v3d'?'600 12px':'600 13px')+' system-ui';X.textAlign='center';
+ const tag=(txt,q,col)=>{X.strokeStyle='#0f1114';X.lineWidth=3.5;X.strokeText(txt,q[0],q[1]);X.fillStyle=col;X.fillText(txt,q[0],q[1])};
+ for(const s of LAY.shelves)tag(s.name,proj([s.x,s.y,(s.height||1.8)+0.14]),'#c3c9d2');
+ for(const f of FIX()){if(f.kind==='door'&&!o.cams)continue;
+  tag(f.name,proj([f.x,f.y,(f.kind==='door'?0:f.height||1)+0.14]),f.kind==='door'?'#7ee2a0':f.kind==='counter'?'#a9c6ee':'#c9c0ad')}
+ if(o.cams)for(const c of LAY.cameras){const q=proj([c.x,c.y,c.height||2.2]);
   X.beginPath();X.arc(q[0],q[1],4.5,0,6.3);X.fillStyle='#ff3b52';X.fill();
   X.textAlign='left';X.strokeStyle='#0f1114';X.lineWidth=3.5;X.strokeText(c.name,q[0]+9,q[1]+4);
   X.fillStyle='#ff6b7d';X.fillText(c.name,q[0]+9,q[1]+4);X.textAlign='center'}
@@ -3483,15 +4122,15 @@ function clip(p,q){const W=LAY.store.w,H=LAY.store.h;let t=1;const dx=q[0]-p[0],
   if(Math.abs(den)<1e-9){if(num<0)return p;continue}
   if(den>0)t=Math.min(t,Math.max(0,num/den))}
  return [p[0]+dx*t,p[1]+dy*t]}
-(function(){const cv=$('v3d');let d=null;
+['v3d','h3d'].forEach(id=>{const cv=$(id);if(!cv)return;let d=null;const st=V3[id],home={...st};
  cv.addEventListener('pointerdown',e=>{d=[e.clientX,e.clientY];cv.style.cursor='grabbing';cv.setPointerCapture(e.pointerId)});
- cv.addEventListener('pointermove',e=>{if(!d)return;YAW+=(e.clientX-d[0])*0.01;
-  PIT=Math.max(0.12,Math.min(1.48,PIT-(e.clientY-d[1])*0.008));d=[e.clientX,e.clientY];draw3d()});
+ cv.addEventListener('pointermove',e=>{if(!d)return;st.yaw+=(e.clientX-d[0])*0.01;
+  st.pit=Math.max(0.12,Math.min(1.48,st.pit-(e.clientY-d[1])*0.008));d=[e.clientX,e.clientY];draw3d(id)});
  addEventListener('pointerup',()=>{d=null;cv.style.cursor='grab'});
- cv.addEventListener('wheel',e=>{e.preventDefault();ZOOM=Math.max(0.4,Math.min(3,ZOOM*(e.deltaY>0?0.92:1.09)));draw3d()},{passive:false});
- cv.addEventListener('dblclick',()=>{YAW=-0.62;PIT=0.92;ZOOM=1;draw3d()})})();
+ cv.addEventListener('wheel',e=>{e.preventDefault();st.zoom=Math.max(0.4,Math.min(3,st.zoom*(e.deltaY>0?0.92:1.09)));draw3d(id)},{passive:false});
+ cv.addEventListener('dblclick',()=>{Object.assign(st,home);draw3d(id)})});
 /* ---------- tabs ---------- */
-const TABS=['home','shelves','checkout','cctv','analytics','setup'];
+const TABS=['home','shelves','checkout','queue','cctv','analytics','setup'];
 let TABV='home';
 function tab(t){if(!TABS.includes(t))t='home';TABV=t;
  for(const x of TABS)$(x).style.display=x===t?'grid':'none';
@@ -3502,6 +4141,7 @@ function tab(t){if(!TABS.includes(t))t='home';TABV=t;
  if(t==='home'){drawMini();if(S)homeCharts(S)}
  if(t==='shelves')shEnter();
  if(t==='checkout')coEnter();
+ if(t==='queue'){qLoad();if(S)qRender(S)}
  if(t==='analytics'){anLoad();liveSeed()}
  if(t==='cctv')cctvBuild()}
 document.querySelectorAll('#tabs .tab').forEach(el=>el.onclick=()=>tab(el.dataset.t));
@@ -3620,15 +4260,17 @@ function ramp(t){t=Math.max(0,Math.min(1,t))*(RAMP.length-1);const i=Math.min(RA
 function heat(el,o){chartShell(el,o,(el,o)=>{
  const W=Math.max(360,el.clientWidth||800),rows=o.rows.length,cols=o.cols.length,m={l:40,r:8,t:6,b:42};
  const cw=(W-m.l-m.r)/cols,ch=Math.min(26,Math.max(16,cw*0.8)),H=m.t+rows*ch+m.b;
- const mx=Math.max(...o.m.flat())||1;let g='';
+ const flat=o.m.flat().filter(v=>v>0).sort((x,y)=>x-y),mx=Math.max(...o.m.flat())||1;
+ const cap=flat.length>10?Math.max(flat[Math.floor(flat.length*0.96)],mx*0.25):mx;   /* the top 4% share the brightest colour: one outlier can't wash the rest out */
+ let g='';
  o.m.forEach((row,r)=>{g+=`<text class="ax" x="${m.l-8}" y="${m.t+r*ch+ch/2+4}" text-anchor="end">${o.rows[r]}</text>`;
   row.forEach((v,c)=>{g+=`<rect data-r="${r}" data-c="${c}" x="${m.l+c*cw+1}" y="${m.t+r*ch+1}" width="${Math.max(1,cw-2)}"
-   height="${ch-2}" rx="3" fill="${v>0?ramp(v/mx):'#171a1e'}"/>`})});
+   height="${ch-2}" rx="3" fill="${v>0?ramp(Math.pow(Math.min(1,v/cap),0.8)):'#171a1e'}"/>`})});
  o.cols.forEach((c,i)=>{if(i%2===0)g+=`<text class="ax" x="${m.l+i*cw+cw/2}" y="${m.t+rows*ch+14}" text-anchor="middle">${c}</text>`});
  const lx=W-m.r-180,ly=H-14;
  g+=`<defs><linearGradient id="hg${el.id}">${RAMP.map((c,i)=>`<stop offset="${i/(RAMP.length-1)}" stop-color="rgb(${c})"/>`).join('')}</linearGradient></defs>
   <text class="ax" x="${lx-8}" y="${ly+4}" text-anchor="end">0</text><rect x="${lx}" y="${ly-5}" width="150" height="9" rx="3" fill="url(#hg${el.id})"/>
-  <text class="ax" x="${lx+158}" y="${ly+4}">${fmtN(mx)}</text>`;
+  <text class="ax" x="${lx+158}" y="${ly+4}">${fmtN(cap)}${cap<mx?'+':''}</text>`;
  el.innerHTML=`<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">${g}</svg>`;
  el.querySelectorAll('rect[data-r]').forEach(r=>{r.onmousemove=e=>{const a=+r.dataset.r,b=+r.dataset.c;
   tipAt(e,`<b>${o.rows[a]} ${o.cols[b]}:00</b><div class="r"><span>${esc(o.name)}</span><span>${(o.fmt||fmtN)(o.m[a][b])}</span></div>`)};
@@ -3654,7 +4296,9 @@ function render(s){S=s;
  $('store').textContent=s.store_id;
  $('cloud').textContent=s.cloud_online==null?'edge only':s.cloud_online?'cloud synced':'offline · buffering';
  if(!ctrSet){$('ctr').value=s.open_counters;ctrSet=true}
- if(s.store_heat)HEAT=s.store_heat;
+ HEATDAY=s.store_heat;HEATNOW=s.store_live;HEAT=HEATMODE==='now'?HEATNOW:HEATDAY;
+ const approx=Object.entries(s.heat_src||{}).filter(([,v])=>v==='approx').map(([k])=>((s.labels||{})[k]||k));
+ if($('hnote'))$('hnote').textContent=approx.length?`${approx.join(', ')}: positions estimated from where the camera is placed — add floor points in Setup for exact`:'';
  if(s.layout&&!DIRTY)LAY=s.layout;
  s.faceStatus={};for(const cam in s.shelves){const cells=s.shelves[cam];if(!cells)continue;
   const w=(s.cam_face||{})[cam];if(!w)continue;let st='OK';
@@ -3689,7 +4333,7 @@ function render(s){S=s;
   .sort((a,b)=>(a.status==='EMPTY'?0:1)-(b.status==='EMPTY'?0:1)||a.est_units/a.full_units-b.est_units/b.full_units);
  $('lowstock').innerHTML=lows.length?lows.slice(0,40).map(c=>`<div class="lowrow"><span class="st ${c.status}">${c.status}</span>
   <div><div class="n">${esc(c.name)}</div><div class="w">${esc((s.labels||{})[c.cam]||c.cam)} · ${esc(c.loc)}</div></div>
-  <div class="u">${c.method==='front'?'~':''}${c.est_units}<small> / ${c.full_units}</small></div></div>`).join('')
+  <div class="u">${cnt(c)}<small> / ${c.full_units}</small></div></div>`).join('')
   :cells.some(c=>c.slot)?'<div class="empty">Every marked product is stocked.</div>':'<div class="empty">No products marked yet.<br><span class="muted">Open Shelves and draw a box round each product.</span></div>';
  const z=Object.entries((s.zones||{})[Object.keys(s.zones||{})[0]]||{});
  $('zones').innerHTML=z.length?`<table><tr><th>Zone</th><th>Visits</th><th>Avg dwell</th></tr>`+
@@ -3700,7 +4344,7 @@ function render(s){S=s;
  if(TABV==='cctv'&&Object.keys(S.cams||{}).join('|')!==CCTVSIG)cctvBuild();   // a camera joined or left
  if(TABV==='setup'&&$('camfeed')&&SEL&&SEL.t==='c')$('camfeed').innerHTML=feedLine(selObj());
  if(TABV==='cctv')cctvBadges();
- coSync(s);liveSample(s)}
+ coSync(s);if(TABV==='checkout')shopDraw();qRender(s);liveSample(s)}
 let HOMEKEY='';
 function homeCharts(s){const key=JSON.stringify(s.hourly);if(key===HOMEKEY&&$('c_today')._draw)return;HOMEKEY=key;
  const hrs=[];for(let h=7;h<=22;h++)hrs.push(h);const now=s.hour_now==null?new Date().getHours():s.hour_now;
@@ -3807,6 +4451,9 @@ function shSide(){const s=SH.slots.find(x=>x.id===SH.sel);let h='';
    <div class="f"><span>units deep</span><input type="number" min="1" max="30" value="${s.deep}" oninput="SHS('deep',this.value)"></div>
    <div class="f"><span>one unit, front to back (cm)</span><input type="number" min="0" max="60" step="0.5" value="${s.unit_cm||''}"
     placeholder="e.g. 7" oninput="SHU(this.value)"></div>
+   ${s.deep>1&&!s.unit_cm?`<div class="warnbox">⚠ <b>${s.deep} deep, but no unit size.</b> Without it the camera can only see the front pack of each
+     column, so a pack taken from the front still shows as full and one put back shows as full again. Enter how deep one pack is.</div>`:''}
+   ${s.deep>1&&s.unit_cm&&SH.cam&&S&&S.depth&&S.depth[SH.cam]&&!S.depth[SH.cam].on?`<div class="warnbox">⚠ <b>Depth counting is off for this camera:</b> ${esc(S.depth[SH.cam].msg)}</div>`:''}
    <div class="hint">A full box holds <b id="sh_full">${s.facings*s.deep}</b> units. With the unit size set, the depth model
     measures how far back the front unit of each column sits and counts what's left behind it. Without it, the count is
     an estimate: facings still visible × units deep.</div>
@@ -3814,7 +4461,7 @@ function shSide(){const s=SH.slots.find(x=>x.id===SH.sel);let h='';
   const lc=liveCell(s.id);
   if(lc&&!SH.dirty)h+=`<div class="box"><h4>Right now</h4><div class="f"><span>status</span><span class="st ${lc.status}">${lc.status}</span></div>
    <div class="f"><span>facings visible</span><b>${lc.present} / ${lc.facings}</b></div>
-   <div class="f"><span>camera count</span><b>${lc.method==='front'?'~':''}${lc.est_units} / ${lc.full_units}</b></div>
+   <div class="f"><span>camera count</span><b>${cnt(lc)} / ${lc.full_units}</b></div>
    <div class="f"><span>counted by</span><span>${lc.method==='front'?'front row × units deep':'depth model, per column: '+lc.columns.join(' · ')+(lc.hidden&&lc.hidden.length?` (column ${lc.hidden.map(i=>i+1).join(', ')} hidden from this angle — front unit gone, rest unseen)`:'')}</span></div>
    <div class="f"><span>by the till</span><b>${lc.pos_units==null?'—':lc.pos_units}</b></div>
    <div class="f"><span>where</span><span>${esc(lc.loc)}</span></div></div>`}
@@ -3862,6 +4509,12 @@ async function shSave(){const msg=$('shmsg');
 async function shCalibrate(){if(!SH.cam)return;$('shmsg').textContent='calibrating…';
  const j=await(await fetch('/api/calibrate/'+SH.cam,{method:'POST'})).json();$('shmsg').textContent=j.message;
  if(/Calibrated/.test(j.message)){SH.calibrated=true;shImg();shSide()}}
+/* a camera count: "3" when every position was checked, "1–3" when only part of it could be, "~" when it rests on the
+   front row alone. The range is the honest answer after a pack is put back at the front: one pack, or a full stack. */
+function cnt(c){const lo=c.est_min==null?c.est_units:c.est_min,hi=c.est_units;
+ return (c.method==='front'||c.exact===false?'~':'')+(lo<hi?`${lo}–${hi}`:hi)}
+async function refilled(cam,slot){await fetch('/api/shelf/'+encodeURIComponent(cam)+'/refilled',{method:'POST',
+ headers:{'Content-Type':'application/json'},body:JSON.stringify({slot})})}
 function shTable(){const el=$('shtable');if(!el||!S)return;const cells=(S.shelves[SH.cam]||[]);
  if(!SH.cam){el.innerHTML='';return}
  if(!cells.length){el.innerHTML=`<div class="empty">${SH.calibrated?'Waiting for the camera…':'Not calibrated yet.'}</div>`;return}
@@ -3872,7 +4525,8 @@ function shTable(){const el=$('shtable');if(!el||!S)return;const cells=(S.shelve
   <td class="muted">${esc(c.loc)}</td><td>${esc(c.name)}${c.brand?`<div class="muted">${esc(c.brand)}</div>`:''}</td>
   <td><div style="display:flex;align-items:center;gap:8px"><div class="bar-in" style="flex:1"><div style="width:${100*c.present/c.facings}%;
    background:${SCOL[c.status]||'#3fb950'}"></div></div><span>${c.present}/${c.facings}</span></div></td>
-  <td>${c.method==='front'?'~':''}${c.est_units} <span class="muted">/ ${c.full_units} · ${{depth:'depth',mixed:'depth, part hidden',front:'front row'}[c.method]||''}</span></td><td>${c.pos_units==null?'<span class="muted">—</span>':c.pos_units}</td>
+  <td>${cnt(c)} <span class="muted">/ ${c.full_units} · ${{depth:'depth',mixed:'depth, part hidden',front:'front row'}[c.method]||''}</span>
+   ${c.est_min!=null&&c.est_min<c.est_units?`<div class="muted" style="font-size:11.5px">at least ${c.est_min} for sure · <a href="#" class="lnk" onclick="refilled('${esc(SH.cam)}','${esc(c.slot)}');return false">refilled</a></div>`:''}</td><td>${c.pos_units==null?'<span class="muted">—</span>':c.pos_units}</td>
   <td><span class="st ${c.occluded?'occ':c.status}">${c.occluded?'BLOCKED':c.status}</span>${c.misplaced?' <span class="st MISPLACED">WRONG PRODUCT</span>':''}</td>
   <td>${c.attention&&c.attention.visits?`${c.attention.visits} stop${c.attention.visits===1?'':'s'} <span class="muted">· avg ${c.attention.avg_s}s</span>`:'<span class="muted">—</span>'}</td>
   <td class="muted">${c.eta_min!=null?'~'+Math.round(c.eta_min)+' min':''}</td></tr>`).join('')+`</table>`}
@@ -3920,7 +4574,7 @@ async function coEnter(){await prodsLoad();
  setTimeout(()=>$('scan').focus(),50)}
 async function cartRefresh(){if(!CART){CARTV=null;cartDraw();return}
  const r=await fetch('/api/cart/'+CART);CARTV=r.ok?await r.json():null;if(!CARTV)CART=null;cartDraw()}
-function cartDraw(flash){const v=CARTV;$('cartid').textContent=v?`cart ${v.id} · ${v.n_items} item${v.n_items===1?'':'s'}`:'';
+function cartDraw(flash){const v=CARTV;SHSIG='';shopDraw();$('cartid').textContent=v?`cart ${v.id} · ${v.n_items} item${v.n_items===1?'':'s'}`:'';
  $('cartlines').innerHTML=v&&v.lines.length?v.lines.map(l=>`<div class="cl ${flash===l.sku?'flash':''}"><div class="n">${esc(l.name)}
   <small>${esc(l.brand)}${l.mrp>l.price?` · MRP ₹${l.mrp}`:''}</small></div>
   <div class="qty"><button onclick="cartQty('${esc(l.sku)}',${l.qty-1})">−</button><b>${l.qty}</b>
@@ -3962,13 +4616,85 @@ async function cartBill(){if(!CART)return;const j=await(await fetch('/api/cart/'
  $('paynote').innerHTML=`<div class="h">Please move to the payment counter</div>
   <div>to complete your purchase.</div><p style="font-size:28px;font-weight:700;margin:14px 0 4px">₹${b.total.toFixed(2)}</p>
   <div class="muted">Bill ${b.id} · ${b.n_items} item${b.n_items===1?'':'s'} · you saved ₹${b.savings.toFixed(2)}</div>
+  <div class="muted" style="margin-top:6px">${b.shopper?`Shopper ${esc(b.shopper.id)} · ${b.shopper.check==='ok'?'ID verified by '+(b.shopper.how==='camera'?'camera':'staff'):'ID check failed: '+esc(b.shopper.check)}`:'No shopper ID was verified for this bill'}</div>
   <div class="bar2" style="margin-top:16px"><button class="pri" onclick="window.open('/api/bills/${b.id}.pdf')">Print bill</button>
    <button onclick="cartNew()">Next customer</button></div>`;
  $('billbox').scrollIntoView({behavior:'smooth'})}
+let SHSIG='';
+/* who is at the till: the door camera's ID for them, found again by clothing colour, or picked by staff */
+function shopDraw(){const el=$('shopbar');if(!el||!S||!S.shoppers)return;const sh=S.shoppers,t=sh.till,cur=CARTV&&CARTV.shopper;
+ const sig=[cur,t&&t.id,t&&Math.round(t.score*100),sh.list.map(x=>x.id+x.billed).join(',')].join('|');
+ if(sig===SHSIG)return;SHSIG=sig;
+ const name=cur?`${esc(cur)}<small>picked by staff</small>`:t?`${esc(t.id)}<small>camera match ${Math.round(t.score*100)}%</small>`:
+  `<span class="muted" style="font-size:14px">${sh.inside?'not identified yet — pick the shopper':'nobody has entered yet'}</span>`;
+ el.innerHTML=`<div class="shop ${cur||t?'ok':'warn'}"><div class="who"><span class="lbl">Shopper ID · checked at checkout</span>
+  <b class="sid">${name}</b></div><select id="shsel" onchange="shopPick(this.value)">
+  <option value="">${t&&!cur?'use the camera match':'choose a shopper…'}</option>${sh.list.map(x=>
+  `<option value="${esc(x.id)}" ${cur===x.id?'selected':''}>${esc(x.id)} · ${x.mins<1?'just came in':Math.round(x.mins)+' min inside'}${x.billed?' · already billed':''}</option>`).join('')}</select></div>`}
+async function shopPick(v){await ensureCart();
+ const r=await(await fetch('/api/cart/'+CART+'/shopper',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({shopper:v})})).json();
+ if(!r.ok){alert(r.error);SHSIG='';shopDraw();return}CARTV=r.cart;SHSIG='';cartDraw()}
 function coSync(s){const ls=s.pos&&s.pos.last_scan;if(!ls||ls.ts<=LASTSCAN)return;LASTSCAN=ls.ts;
  if(TABV!=='checkout'||ls.source==='screen')return;const t=$('scantoast');   /* screen scans report inline */
  if(t)t.innerHTML=`<div class="toast ${ls.ok?'ok':'bad'}">${esc(ls.msg)}${ls.ok&&ls.price!=null?` · ₹${ls.price}`:''}</div>`;
  if(ls.ok&&s.pos.active_cart){CART=s.pos.active_cart;cartRefresh()}}
+
+/* ---------- queue ---------- */
+let QA=null,QT=0,QCTRSET=false;
+async function qLoad(){if(Date.now()-QT<20000)return;QT=Date.now();
+ try{QA=await(await fetch('/api/queue')).json()}catch(e){}qCharts()}
+const mins=m=>m==null?'—':m<1?'under a minute':m<60?'~'+Math.round(m*10)/10+' min':'over an hour';
+function qMain(s){const qs=Object.entries(s.queues||{});            // the busiest queue camera drives the page
+ return qs.length?qs.sort((a,b)=>b[1].length-a[1].length)[0]:null}
+function qRender(s){const m=qMain(s),q=m&&m[1],crowds=s.crowds||[],calls=s.alerts.filter(a=>a.kind==='queue'||a.kind==='crowd');
+ $('qdot').className='tabdot'+(calls.some(a=>a.severity==='critical')?' on':calls.length?' on warn':'');
+ if(TABV!=='queue')return;
+ if(!QCTRSET&&document.activeElement!==$('qctr')){$('qctr').value=s.open_counters;QCTRSET=true}
+ const k=s.open_counters;
+ $('qkpis').innerHTML=q?kpi('In line now',q.length,'people')+kpi('Wait',q.wait_min+' min','for the last in line',q.wait_min>=4?'warn':'')+
+  kpi('Clears in',q.length===0?'—':q.clear_min==null?'not clearing':mins(q.clear_min),`with ${k} counter${k===1?'':'s'}`,q.length&&q.clear_min==null?'bad':'')+
+  kpi('Arriving',q.arrival_per_min+'/min','last 5 min')+kpi('Served',q.service_per_counter_min+'/min','per counter, learned')+
+  kpi('Peak today',(s.queue_peak||{}).len||0,'people in line'):
+  kpi('Queue camera','none','give a camera the “watch queue” job in Setup');
+ let v='';
+ if(!q)v='<div class="empty">No queue camera yet.<br><span class="muted">In Setup, give a camera the “watch queue” job.</span></div>';
+ else{const rec=q.recommend_counters,cls=q.length===0?'ok':q.clear_min==null?'bad':q.clear_min>CFGW?'warn':'ok';
+  const head=q.length===0?'Empty':q.clear_min==null?'No':mins(q.clear_min);
+  const why=q.length===0?'Nobody is waiting.':q.clear_min==null?
+   `<b>${q.arrival_per_min}</b> people arrive a minute but ${k} counter${k===1?' serves':'s serve'} only <b>${(q.service_per_counter_min*k).toFixed(1)}</b>. The line keeps growing${q.clear_min_if_opened?` — with <b>${rec}</b> counters it would clear in <b>${mins(q.clear_min_if_opened)}</b>`:''}.`:
+   `<b>${q.length}</b> in line, shrinking by about <b>${(q.service_per_counter_min*k-q.arrival_per_min).toFixed(1)}</b> a minute at ${k} counter${k===1?'':'s'}.`;
+  v=`<div class="verdict ${cls}"><div class="big">${head}</div><div class="why">${why}</div></div>`}
+ $('qverdict').innerHTML=v;
+ $('qwhatif').innerHTML=q?`<tr><th>Counters open</th><th>Wait for the last in line</th><th>Line gone in</th><th></th></tr>`+
+  q.what_if.map(w=>`<tr class="${w.counters===k?'cur':''} ${w.counters===q.recommend_counters&&w.counters!==k?'rec':''}"><td><b>${w.counters}</b>${w.counters===k?'<span class="tag">now</span>':''}${w.counters===q.recommend_counters&&w.counters!==k?'<span class="tag">suggested</span>':''}</td>
+   <td>${w.wait_min} min</td><td>${w.clear_min==null?'<span style="color:var(--bad)">never — still growing</span>':w.clear_min===0?'—':mins(w.clear_min)}</td>
+   <td>${w.keeps_up?'<span style="color:var(--ok)">keeps up</span>':'<span class="muted">falls behind</span>'}</td></tr>`).join(''):'';
+ const need=q&&q.recommend_counters>k;$('qopen').style.display=need?'':'none';if(need)$('qopen').textContent=`Open ${q.recommend_counters-k} more (${q.recommend_counters} total)`;
+ const cam=qMain(s)&&qMain(s)[0];if(cam&&$('qcam').dataset.cam!==cam){$('qcam').dataset.cam=cam;
+  $('qcam').innerHTML=`<img class="live qimg" data-cam="${esc(cam)}" alt="queue camera"><div class="muted" style="margin-top:6px">${esc((s.labels||{})[cam]||cam)} · the yellow outline is the queue zone</div>`}
+ $('qcrowdsub').textContent=`alert at ${s.crowd_threshold}+ people in one camera's view`;
+ $('qcrowds').innerHTML=crowds.length?crowds.map(c=>`<div class="crowd ${c.people>=1.5*s.crowd_threshold?'crit':''}"><div class="n">${c.people}</div>
+  <div><div class="w">${esc(c.where)}</div><div class="t">for ${c.for_s<90?c.for_s+' s':Math.round(c.for_s/60)+' min'} · peak ${c.peak}</div></div>
+  <div class="t">${c.staff_alert?'staff alerted':'—'}</div>
+  <div class="eta">${c.eta_min===0?'Easing off — back under the limit.':c.eta_min==null?'<b>Not thinning yet</b> — no estimate until the count starts to fall.':
+   `Expected to thin out in <b>${mins(c.eta_min)}</b> <span class="muted">(trend of the last couple of minutes)</span>`}</div></div>`).join(''):
+  `<div class="empty">No crowds right now.<br><span class="muted">Every camera is watched; staff are called when one sees ${s.crowd_threshold}+ people for a few seconds.</span></div>`;
+ $('qcalls').innerHTML=calls.length?calls.map(a=>`<div class="alert ${a.severity}"><div class="m"><div class="top"><span class="a">${esc(a.action)}</span><span class="t">${ago(a.ts)}</span></div>
+  <div class="msg">${esc(a.message)}</div></div><button onclick="ack(${a.id})">On it</button></div>`).join(''):'<div class="empty">Nobody needs calling.</div>';
+ $('qresp').textContent=s.avg_response_s==null?'':`average response today ${Math.round(s.avg_response_s)} s`}
+const CFGW=6;
+function qCharts(){const a=QA;if(!a||TABV!=='queue')return;
+ const rows=a.today;
+ lineChart($('q_today'),{labels:rows.map(r=>new Date(r.t*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})),
+  series:[{name:'In line',color:CC.s1,values:rows.map(r=>r.len)},{name:'Wait (min)',color:CC.s2,values:rows.map(r=>r.wait)}],h:260});
+ const hrs=[];for(let h=7;h<=22;h++)hrs.push(h);
+ heat($('q_heat'),{rows:WD,cols:hrs.map(h=>String(h).padStart(2,'0')),m:a.weekday_hour.map(r=>hrs.map(h=>r[h])),name:'people in line (avg)'});
+ const t=a.stats;$('qstats').innerHTML=[['Served',t.served],['Average time in queue',t.avg_in_queue_min==null?'—':t.avg_in_queue_min+' min'],
+  ['Longest line',t.peak_len+' people'],['Longest wait',t.peak_wait_min+' min'],['Average wait',t.avg_wait_min==null?'—':t.avg_wait_min+' min'],
+  ['Busiest hour',t.busiest_hour||'—'],['Crowds today',a.crowds.length]].map(r=>`<div>${r[0]}</div><div>${r[1]}</div>`).join('')}
+async function qSetCounters(){await fetch('/api/counters?open='+$('qctr').value,{method:'POST'});QCTRSET=false}
+async function qOpenRec(){const q=qMain(S)[1];$('qctr').value=q.recommend_counters;await qSetCounters()}
+setInterval(()=>{if(TABV==='queue'){QT=0;qLoad()}},30000);
 
 /* ---------- cctv ---------- */
 let CCTVV='cctv';
@@ -3984,18 +4710,18 @@ function cctvBadges(){for(const [n,c] of Object.entries(S.cams||{})){const b=$('
 
 /* ---------- analytics ---------- */
 let ADAYS=14,AN=null;
-document.querySelectorAll('#arange .chip').forEach(c=>c.onclick=()=>{ADAYS=+c.dataset.d;
- document.querySelectorAll('#arange .chip').forEach(x=>x.classList.toggle('on',x===c));anLoad()});
+document.querySelectorAll('#arange button').forEach(c=>c.onclick=()=>{ADAYS=+c.dataset.d;
+ document.querySelectorAll('#arange button').forEach(x=>x.classList.toggle('on',x===c));anLoad()});
 /* live: 1-second samples from the dashboard's own state, seeded with the last hour of per-minute history */
 let LIVE={pts:[],hist:[],win:300,seeded:0};
 function liveSample(s){const q=Object.values(s.queues||{});
  LIVE.pts.push({t:s.ts,inside:s.footfall.inside,queue:q.reduce((a,x)=>a+x.length,0),ent:s.footfall.in,sales:s.sales_today||0});
  const cut=s.ts-3700;while(LIVE.pts.length&&LIVE.pts[0].t<cut)LIVE.pts.shift();
- if(TABV==='analytics')liveDraw()}
+ if(TABV==='analytics'){liveDraw();anShop(s)}}
 async function liveSeed(){if(Date.now()-LIVE.seeded<60000)return;LIVE.seeded=Date.now();
  try{LIVE.hist=(await(await fetch('/api/live?minutes=60')).json()).rows}catch(e){}liveDraw()}
-document.querySelectorAll('#lwin .chip').forEach(c=>c.onclick=()=>{LIVE.win=+c.dataset.w;
- document.querySelectorAll('#lwin .chip').forEach(x=>x.classList.toggle('on',x===c));liveDraw()});
+document.querySelectorAll('#lwin button').forEach(c=>c.onclick=()=>{LIVE.win=+c.dataset.w;
+ document.querySelectorAll('#lwin button').forEach(x=>x.classList.toggle('on',x===c));liveDraw()});
 function liveSeries(key,hkey){const t0=LIVE.pts.length?LIVE.pts[0].t:Infinity;
  return LIVE.hist.filter(r=>r.t<t0&&r[hkey]!=null).map(r=>[r.t,r[hkey]]).concat(LIVE.pts.map(p=>[p.t,p[key]]))}
 function livePerMinute(){const by={},live={},pts=LIVE.pts;
@@ -4017,10 +4743,10 @@ function liveDraw(){if(!$('l_inside'))return;const now=LIVE.pts.length?LIVE.pts[
  liveChart($('l_inside'),ins,{now,color:CC.s1,int:true,name:'inside'});
  liveChart($('l_ent'),ent,{now,color:CC.s1,int:true,bars:true,name:'entries'});
  liveChart($('l_queue'),que,{now,color:CC.s2,int:true,name:'in line'});
- liveChart($('l_sales'),sal,{now,color:CC.s2,fmt:fmtR,yfmt:fmtRs,name:'sales today'})}
+ liveChart($('l_sales'),sal,{now,color:CC.s2,fmt:fmtR,yfmt:fmtRs,name:'sales today',min:100})}
 function liveChart(el,pts,o){const W=Math.max(300,el.clientWidth||500),H=190,m={l:54,r:14,t:10,b:28};
  const win=LIVE.win,t0=o.now-win,iw=W-m.l-m.r,ih=H-m.t-m.b,vis=pts.filter(p=>p[0]>=t0-60);
- const T=ticks(Math.max(0,...vis.map(p=>p[1]||0))*1.1,o.int),mx=T.mx;
+ const T=ticks(Math.max(o.min||0,...vis.map(p=>p[1]||0))*1.1,o.int),mx=T.mx;
  const X=t=>m.l+(t-t0)/win*iw,Y=v=>m.t+ih-(v/mx)*ih;
  let g=yAxis(m,W,ih,mx,o.yfmt,T.n);
  const stepT=win/5;for(let k=0;k<=5;k++){const t=t0+k*stepT,lab=k===5?'now':'−'+Math.round((win-k*stepT)/60)+'m';
@@ -4042,6 +4768,46 @@ function liveChart(el,pts,o){const W=Math.max(300,el.clientWidth||500),H=190,m={
   tipAt(e,`<b>${new Date(best[0]*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}</b>
    <div class="r"><span>${o.name}</span><span>${(o.fmt||fmtN)(best[1])}</span></div>`)};
  hit.onmouseleave=()=>{xh.innerHTML='';untip()}}
+/* a tiny trend line under each KPI */
+function spark(vals,col){const v=vals.map(x=>x==null?0:x);if(v.length<2||Math.max(...v)===0)return '<svg viewBox="0 0 100 38"></svg>';
+ const mx=Math.max(...v),mn=Math.min(...v),sp=(mx-mn)||1,X=i=>i*100/(v.length-1),Y=x=>34-(x-mn)/sp*28;
+ const d=v.map((x,i)=>(i?'L':'M')+X(i).toFixed(1)+','+Y(x).toFixed(1)).join('');
+ return `<svg viewBox="0 0 100 38" preserveAspectRatio="none"><path d="${d}L100,38L0,38Z" fill="${col}" fill-opacity=".13"/>
+  <path d="${d}" fill="none" stroke="${col}" stroke-width="1.8" vector-effect="non-scaling-stroke" stroke-linejoin="round"/></svg>`}
+/* change between the first and second half of the range — better to say what it is than to imply a forecast */
+function halves(vals,sum){const n=vals.length,h=Math.floor(n/2);if(h<2)return null;
+ const f=x=>sum?x.reduce((p,c)=>p+(c||0),0):(x.filter(c=>c!=null).reduce((p,c)=>p+c,0)/Math.max(1,x.filter(c=>c!=null).length));
+ const a=f(vals.slice(0,h)),b=f(vals.slice(n-h));return a?{a,b,pct:(b-a)/a}:null}
+function pill(ch,goodUp,asPts){if(!ch)return '<span class="muted">no earlier period</span>';
+ const d=asPts?(ch.b-ch.a)*100:ch.pct*100,t=asPts?`${Math.abs(d).toFixed(1)} pts`:`${Math.abs(d).toFixed(0)}%`;
+ if(Math.abs(d)<(asPts?0.5:1))return '<span class="pill flat">▬ steady</span><span>vs earlier half</span>';
+ const up=d>0,good=up===goodUp;return `<span class="pill ${good?'up':'dn'}">${up?'▲':'▼'} ${t}</span><span>vs earlier half</span>`}
+function anKpis(a,days){const k=a.kpis,col=CC.s1;
+ const ent=days.map(d=>d.entries),bil=days.map(d=>d.bills),rev=days.map(d=>d.revenue),
+  bsk=days.map(d=>d.bills?d.revenue/d.bills:null),cv=days.map(d=>d.conversion),
+  wait=days.map(d=>null);
+ const card=(l,v,sub,ch,goodUp,vals,pts)=>`<div class="hk"><div class="l">${l}</div><div class="v">${v}</div>
+  <div class="dl">${ch===undefined?`<span>${sub||''}</span>`:pill(ch,goodUp,pts)}</div>${vals?spark(vals,col):''}</div>`;
+ $('akpis').innerHTML=card('Footfall',fmtN(k.footfall),'',halves(ent,true),true,ent)+
+  card('Bills',fmtN(k.bills),'',halves(bil,true),true,bil)+
+  card('Revenue',fmtRs(k.revenue),'',halves(rev,true),true,rev)+
+  card('Average bill',fmtR(k.avg_basket),'',halves(bsk,false),true,bsk)+
+  card('Conversion',fmtP(k.conversion),'',halves(cv,false),true,cv,true)+
+  card('Avg queue wait',k.avg_wait_min==null?'—':k.avg_wait_min+' min',`${fmtN(k.items)} items sold · ${k.stockouts} stock-outs`,undefined,false,null)}
+function anInsights(a,days){const k=a.kpis,out=[];
+ if(k.peak_hour){const h=+k.peak_hour.slice(0,2);out.push(['⏱','Busiest hour',`Most people arrive around <em>${k.peak_hour}</em> — about <em>${fmtN(a.hourly_avg[h])}</em> entries an hour on an average day.`])}
+ const bd=days.slice().sort((x,y)=>y.revenue-x.revenue)[0];
+ if(bd&&bd.revenue)out.push(['₹','Best day',`<em>${dlong(bd.date)}</em> took <em>${fmtR(bd.revenue)}</em> from ${fmtN(bd.bills)} bills.`]);
+ const tp=(a.top_products||[])[0];
+ if(tp)out.push(['★','Best seller',`<em>${esc(tp.name)}</em> brought in <em>${fmtR(tp.revenue)}</em> (${fmtN(tp.units)} units).`]);
+ const so=(a.stockouts||[])[0];
+ if(so)out.push(['!','Ran out most',`<em>${esc(so.name)}</em> hit empty <em>${so.count}</em> times — worth a bigger shelf allocation.`]);
+ const at=(a.attention||[])[0];
+ if(at)out.push(['◉','Most looked at',`Shoppers stopped at <em>${esc(at.name)}</em> <em>${fmtN(at.stops)}</em> times, about ${at.avg_s} s each.`]);
+ $('ains').innerHTML=out.slice(0,4).map(([i,t,x])=>`<div class="in"><div class="ic">${i}</div><div><b>${t}</b><span>${x}</span></div></div>`).join('')}
+function anShop(s){const sh=s&&s.shoppers;if(!sh||!$('a_shop'))return;
+ $('a_shop').innerHTML=`<div class="ashop"><div><b>${sh.issued}</b><span>IDs issued</span></div><div><b>${sh.inside}</b><span>inside now</span></div>
+  <div><b>${sh.left_unbilled}</b><span>left without a bill</span></div><div><b style="${sh.unverified?'color:var(--low)':''}">${sh.unverified}</b><span>bills without a verified ID</span></div></div>`}
 async function anLoad(){AN=await(await fetch('/api/analytics?days='+ADAYS)).json();anRender()}
 const WD=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 const dshort=d=>new Date(d+'T00:00:00').toLocaleDateString('en-IN',{day:'numeric',month:'short'});
@@ -4051,10 +4817,10 @@ function anRender(){const a=AN;if(!a)return;const k=a.kpis;
  b.innerHTML=a.has_demo?`<b>Includes generated demo history.</b> Past days were filled in with
   <code>--demo-history</code> so the charts have something to show; those rows are tagged in the database and
   real trading is added on top. Remove them with <code>python storesense.py --clear-demo</code>.`:'';
- $('akpis').innerHTML=kpi('Footfall',fmtN(k.footfall),`${fmtN(k.footfall_per_day)} a day`)+kpi('Bills',fmtN(k.bills))+
-  kpi('Revenue',fmtRs(k.revenue))+kpi('Average bill',fmtR(k.avg_basket))+kpi('Conversion',fmtP(k.conversion))+
-  kpi('Items sold',fmtN(k.items))+kpi('Avg queue wait',k.avg_wait_min==null?'—':k.avg_wait_min+' min')+
-  kpi('Busiest hour',k.peak_hour||'—')+kpi('Stock-outs',k.stockouts);
+ const t0=new Date(),today0=`${t0.getFullYear()}-${String(t0.getMonth()+1).padStart(2,'0')}-${String(t0.getDate()).padStart(2,'0')}`;
+ let full=a.daily.filter(d=>d.date!==today0);if(!full.some(d=>d.entries||d.bills))full=a.daily;
+ anKpis(a,full);anInsights(a,full);
+ $('asub').textContent=`${dshort(a.from)} – ${dshort(a.to)} · ${a.days} days${a.has_demo?' · includes generated demo history':''}`;
  const t=new Date(),today=`${t.getFullYear()}-${String(t.getMonth()+1).padStart(2,'0')}-${String(t.getDate()).padStart(2,'0')}`;
  let days=a.daily.filter(d=>d.date!==today);if(!days.some(d=>d.entries||d.bills))days=a.daily;
  const dl=days.map(d=>dshort(d.date)),dL=days.map(d=>dlong(d.date));
@@ -4237,6 +5003,15 @@ def make_app(engine, workers, store):
             time.sleep(0.2)
         return {"message": w.calib_msg or "Camera not responding"}
 
+    @app.post("/api/shelf/{cam}/refilled")
+    async def shelf_refilled(cam: str, req: Request):
+        """Staff topped a product box up: drop the doubt about how many packs are behind the front one."""
+        w = workers.get(cam)
+        if not isinstance(w, ShelfWorker):
+            raise HTTPException(404, "not a shelf camera")
+        w.refilled((await req.json()).get("slot", ""))
+        return {"ok": True}
+
     @app.get("/api/layout")
     def get_layout():
         lay = engine.layout
@@ -4252,12 +5027,16 @@ def make_app(engine, workers, store):
             data = lay.save(await req.json())
         except (KeyError, TypeError, ValueError) as e:
             return {"ok": False, "error": f"bad layout: {e}"}
-        with engine.lock:                       # store size may have changed -> regrid the heatmap
-            engine.store_heat = np.zeros(lay.grid_dims(), np.float32)
+        with engine.lock:                       # only a new store size needs a new grid; moving a shelf keeps the day's heat
+            if engine.store_heat is None or engine.store_heat.shape != lay.grid_dims():
+                engine.store_heat = np.zeros(lay.grid_dims(), np.float32)
+                engine.store_live = np.zeros_like(engine.store_heat)
         for w in workers.values():              # cameras may have moved -> rebuild their mappings
             if hasattr(w, "storeH"):
-                w.storeH = w.H = None
-                w._quad = w._rect = None
+                w.storeH = w._sp_sig = None
+                if hasattr(w, "H"):
+                    w.H = None
+                    w._quad = w._rect = None
         cams = sync_cams(engine, workers)       # new/changed sources start now, no restart
         return {"ok": True, "layout": data, "coverage": coverage(data), "cams": cams}
 
@@ -4490,10 +5269,27 @@ def make_app(engine, workers, store):
         engine.cart_set(cid, b.get("sku", ""), int(b.get("qty", 0)))
         return engine.cart_view(cid) or {"lines": []}
 
+    @app.post("/api/cart/{cid}/shopper")
+    async def cart_shopper(cid: str, req: Request):
+        """Staff picks (or types) the shopper this cart belongs to; an empty ID clears it."""
+        b = await req.json()
+        err = engine.cart_shopper(cid, b.get("shopper", ""))
+        return {"ok": err is None, "error": err, "cart": engine.cart_view(cid)}
+
     @app.post("/api/cart/{cid}/checkout")
-    def do_checkout(cid: str):
-        bill, err = engine.checkout(cid)
+    async def do_checkout(cid: str, req: Request):
+        try:
+            body = await req.json()
+        except Exception:
+            body = {}
+        bill, err = engine.checkout(cid, (body or {}).get("shopper"))
         return {"ok": bill is not None, "error": err, "bill": bill}
+
+    @app.get("/api/shoppers")
+    def shoppers():
+        """Everyone currently inside, by anonymous ID, and today's entry/billing tally."""
+        with engine.lock:
+            return engine.shopper_view()
 
     @app.get("/api/bills/{bid}.{ext}")
     def get_bill(bid: str, ext: str):
@@ -4511,6 +5307,10 @@ def make_app(engine, workers, store):
                 data = fh.read()
         return Response(data, media_type="image/png" if ext == "png" else "application/pdf",
                         headers={"Content-Disposition": f'inline; filename="{bid}.{ext}"'})
+
+    @app.get("/api/queue")
+    def queue_api(days: int = 14):
+        return queue_analytics(store, days)
 
     @app.get("/api/analytics")
     def get_analytics(days: int = 14):
